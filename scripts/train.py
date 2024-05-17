@@ -16,8 +16,8 @@ from ignite.metrics.regression import R2Score, PearsonCorrelation
 from torch.utils.data import DataLoader, Subset
 from operator import itemgetter
 
-from ..model import CVAE
-from ..taxi.dataset import TaxiDataset
+from cvae import CVAE
+from taxi import TaxiDataset
 
 logger = logging.getLogger(__name__)
 
