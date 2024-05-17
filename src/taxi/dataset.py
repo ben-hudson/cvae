@@ -45,4 +45,4 @@ class TaxiDataset(torch.utils.data.Dataset):
         action = self.action[index]
         latents = self.latents[index]
 
-        return obs, action, latents
+        return obs.reshape(-1), action, latents
