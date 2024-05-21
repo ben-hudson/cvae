@@ -9,13 +9,22 @@ from ignite.contrib.metrics import GpuInfo
 from ignite.engine import Engine, Events
 from ignite.handlers import Checkpoint, DiskSaver, TerminateOnNan, TimeLimit, ProgressBar
 from ignite.metrics import RunningAverage
-from itertools import pairwise
 from metrics import mcc as mcc_score, r2_score
 from taxi.dataset import TaxiDataset
 from torch.utils.data import DataLoader, Subset
 
 TrainState = namedtuple('TrainState', ['kld', 'mse', 'loss'])
 EvalState = namedtuple('EvalState', ['kld', 'mse', 'r2', 'mcc'])
+
+# pairwise is available in itertools in Python 3.10+
+# https://docs.python.org/3/library/itertools.html#itertools.pairwise
+def pairwise(iterable):
+    # pairwise('ABCDEFG') → AB BC CD DE EF FG
+    iterator = iter(iterable)
+    a = next(iterator, None)
+    for b in iterator:
+        yield a, b
+        a = b
 
 def get_datasets(args):
     dataset = TaxiDataset(args.path, no_norm=args.no_norm, latent_cost=args.latent_cost, obs_slack=args.obs_slack)
