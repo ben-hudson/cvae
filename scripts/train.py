@@ -2,29 +2,20 @@ import argparse
 import numpy as np
 import pathlib
 import torch
-import logging
 
 from collections import namedtuple
 from cvae import CVAE
 from ignite.contrib.metrics import GpuInfo
 from ignite.engine import Engine, Events
-from ignite.handlers import Checkpoint, DiskSaver, Timer, TerminateOnNan, TimeLimit, ProgressBar
-from ignite.metrics.regression import R2Score, PearsonCorrelation
+from ignite.handlers import Checkpoint, DiskSaver, TerminateOnNan, TimeLimit, ProgressBar
 from ignite.metrics import RunningAverage
 from itertools import pairwise
+from metrics import mcc as mcc_score, r2_score
 from taxi.dataset import TaxiDataset
 from torch.utils.data import DataLoader, Subset
-from ignite.utils import setup_logger
-from tqdm import tqdm
-
-# logger = logging.getLogger(__name__)
-# logger.setLevel(logging.DEBUG)
-# console_handler = logging.StreamHandler()
-# console_handler.setLevel(logging.DEBUG)
-# logger.addHandler(console_handler)
 
 TrainState = namedtuple('TrainState', ['kld', 'mse', 'loss'])
-EvalState = namedtuple('EvalState', ['y', 'y_hat', 'z', 'z_hat'])
+EvalState = namedtuple('EvalState', ['kld', 'mse', 'r2', 'mcc'])
 
 def get_datasets(args):
     dataset = TaxiDataset(args.path, no_norm=args.no_norm, latent_cost=args.latent_cost, obs_slack=args.obs_slack)
@@ -38,7 +29,7 @@ def get_datasets(args):
     subsets = tuple(Subset(dataset, indices[start:end]) for start, end in pairwise(split_indices))
     return subsets
 
-def get_trainer(model, args, device='cpu'):
+def get_trainer(model: torch.nn.Module, args: namedtuple, device='cpu'):
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
 
     assert args.kld_weight >= 0 and args.kld_weight <= 1, f'kld weight must be between 0 and 1, it is {args.kld_weight}'
@@ -67,7 +58,7 @@ def get_trainer(model, args, device='cpu'):
 
     return trainer
 
-def get_evaluator(model, args, device='cpu'):
+def get_evaluator(model: torch.nn.Module, args: namedtuple, device='cpu'):
     def eval_step(evaluator, batch):
         model.eval()
         with torch.no_grad():
@@ -75,12 +66,14 @@ def get_evaluator(model, args, device='cpu'):
             obs, cond = obs.to(device), cond.to(device)
 
             prior, posterior, obs_hat, mse, kld = model(obs, cond)
+            r2 = r2_score(latent, prior.loc)
+            mcc = mcc_score(latent, prior.loc)
 
-            return EvalState(obs.cpu(), obs_hat.cpu(), latent.cpu(), prior.loc.cpu())
+            return EvalState(kld.cpu().item(), mse.cpu().item(), r2, mcc)
 
     evaluator = Engine(eval_step)
-    R2Score(output_transform=lambda state: (state.z_hat.flatten(), state.z.flatten())).attach(evaluator, name='R^2')
-    PearsonCorrelation(output_transform=lambda state: (state.z_hat.flatten(), state.z.flatten())).attach(evaluator, name='MCC')
+    RunningAverage(output_transform=lambda state: state.r2).attach(evaluator, 'R^2')
+    RunningAverage(output_transform=lambda state: state.mcc).attach(evaluator, 'MCC')
     return evaluator
 
 def get_argparser():
@@ -109,8 +102,8 @@ def get_argparser():
     model_args.add_argument('--latent_dim_to_gt', action='store_true', help='Set model latent dimension to ground truth')
     model_args.add_argument('--hidden_dim', type=int, default=64, help='Hidden dimension in model MLPs')
 
-    model_args = parser.add_argument_group('logging', description='Logging arguments')
-    model_args.add_argument('--log_level', choices=logging.getLevelNamesMapping().keys(), default=logging.INFO, help='Log level')
+    # model_args = parser.add_argument_group('logging', description='Logging arguments')
+    # model_args.add_argument('--log_level', choices=logging.getLevelNamesMapping().keys(), default=logging.INFO, help='Log level')
 
     return parser
 
@@ -119,7 +112,7 @@ if __name__ == '__main__':
 
     train_set, val_set, test_set = get_datasets(args)
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, drop_last=True)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, drop_last=True)
+    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, drop_last=True)
 
     device = 'cuda:0' if torch.cuda.is_available() and not args.no_gpu else 'cpu'
 
@@ -141,7 +134,7 @@ if __name__ == '__main__':
     def log_validation_metrics(trainer: Engine):
         evaluator.run(val_loader)
         # hacky, but the only way to get trainer and evaluator metrics on the same bar
-        all_metrics = dict(**trainer.state.metrics, **evaluator.state.metrics)
-        progress.pbar.set_postfix(all_metrics)
+        metrics = dict(**trainer.state.metrics, **evaluator.state.metrics)
+        progress.pbar.set_postfix(metrics)
 
     trainer.run(train_loader, max_epochs=args.max_epochs)
