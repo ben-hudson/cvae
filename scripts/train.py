@@ -9,7 +9,7 @@ from ignite.contrib.metrics import GpuInfo
 from ignite.engine import Engine, Events
 from ignite.handlers import Checkpoint, DiskSaver, TerminateOnNan, TimeLimit, ProgressBar
 from ignite.metrics import RunningAverage
-from metrics import mcc as mcc_score, r2_score
+from metrics import mean_corr_coef_np as mcc_score, r2_score
 from taxi.dataset import TaxiDataset
 from torch.utils.data import DataLoader, Subset
 from typing import Tuple
@@ -75,7 +75,7 @@ def get_evaluator(model: torch.nn.Module, args: namedtuple, device='cpu'):
             obs, cond, latent = batch
             obs, cond = obs.to(device), cond.to(device)
 
-            prior, obs_hat = model.sample(obs, cond)
+            prior, obs_hat = model.sample(cond)
             prior_mean = prior.loc.cpu()
 
             r2 = r2_score(latent, prior_mean)
