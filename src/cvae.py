@@ -44,7 +44,7 @@ class CVAE(nn.Module):
         self.recognition_net = Encoder(obs_dim + condition_dim, latent_dim, hidden_dim, hidden_dim // 2)
         self.generation_net = Decoder(latent_dim, obs_dim, hidden_dim // 2, hidden_dim)
 
-    def sample(self, condition):
+    def sample(self, condition: torch.Tensor):
         # first, get the conditioned latent distribution p(z|x)
         prior = self.prior_net(condition)
         # take some samples

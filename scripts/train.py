@@ -12,9 +12,10 @@ from ignite.metrics import RunningAverage
 from metrics import mcc as mcc_score, r2_score
 from taxi.dataset import TaxiDataset
 from torch.utils.data import DataLoader, Subset
+from typing import Tuple
 
 TrainState = namedtuple('TrainState', ['kld', 'mse', 'loss'])
-EvalState = namedtuple('EvalState', ['kld', 'mse', 'r2', 'mcc'])
+EvalState = namedtuple('EvalState', ['r2', 'mcc'])
 
 # pairwise is available in itertools in Python 3.10+
 # https://docs.python.org/3/library/itertools.html#itertools.pairwise
@@ -38,7 +39,7 @@ def get_datasets(args):
     subsets = tuple(Subset(dataset, indices[start:end]) for start, end in pairwise(split_indices))
     return subsets
 
-def get_trainer(model: torch.nn.Module, args: namedtuple, device='cpu'):
+def get_trainer(model: torch.nn.Module, args: namedtuple, device='cpu') -> Tuple[Engine, torch.optim.Optimizer]:
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
 
     assert args.kld_weight >= 0 and args.kld_weight <= 1, f'kld weight must be between 0 and 1, it is {args.kld_weight}'
@@ -65,25 +66,60 @@ def get_trainer(model: torch.nn.Module, args: namedtuple, device='cpu'):
     trainer.add_event_handler(Events.ITERATION_COMPLETED, TerminateOnNan())
     trainer.add_event_handler(Events.ITERATION_COMPLETED, TimeLimit(limit_sec=args.max_hours*3600))
 
-    return trainer
+    return trainer, optimizer
 
 def get_evaluator(model: torch.nn.Module, args: namedtuple, device='cpu'):
-    def eval_step(evaluator, batch):
+    def eval_step(evaluator: Engine, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
         model.eval()
         with torch.no_grad():
             obs, cond, latent = batch
             obs, cond = obs.to(device), cond.to(device)
 
-            prior, posterior, obs_hat, mse, kld = model(obs, cond)
-            r2 = r2_score(latent, prior.loc)
-            mcc = mcc_score(latent, prior.loc)
+            prior, obs_hat = model.sample(obs, cond)
+            prior_mean = prior.loc.cpu()
 
-            return EvalState(kld.cpu().item(), mse.cpu().item(), r2, mcc)
+            r2 = r2_score(latent, prior_mean)
+            mcc = mcc_score(latent, prior_mean)
+
+            return EvalState(r2, mcc)
 
     evaluator = Engine(eval_step)
     RunningAverage(output_transform=lambda state: state.r2).attach(evaluator, 'R^2')
     RunningAverage(output_transform=lambda state: state.mcc).attach(evaluator, 'MCC')
     return evaluator
+
+def setup_wandb_logger(args: namedtuple, trainer: Engine, evaluator: Engine, optimizer: torch.optim.Optimizer):
+    from ignite.handlers.wandb_logger import WandBLogger
+
+    wandb_logger = WandBLogger(
+        project=args.wandb_project,
+        name=args.wandb_exp,
+        config=args,
+        tags=args.wandb_tags
+    )
+
+    wandb_logger.attach_output_handler(
+        trainer,
+        event_name=Events.ITERATION_COMPLETED,
+        tag='Training',
+        metric_names='all'
+    )
+
+    # wandb_logger.attach_opt_params_handler(
+    #     trainer,
+    #     event_name=Events.ITERATION_STARTED,
+    #     optimizer=optimizer,
+    # )
+
+    wandb_logger.attach_output_handler(
+        evaluator,
+        event_name=Events.EPOCH_COMPLETED,
+        tag='Validation',
+        metric_names='all',
+        global_step_transform=lambda *_: trainer.state.iteration,
+    )
+
+    return wandb_logger
 
 def get_argparser():
     parser = argparse.ArgumentParser('Train CVAE on a dataset')
@@ -111,8 +147,10 @@ def get_argparser():
     model_args.add_argument('--latent_dim_to_gt', action='store_true', help='Set model latent dimension to ground truth')
     model_args.add_argument('--hidden_dim', type=int, default=64, help='Hidden dimension in model MLPs')
 
-    # model_args = parser.add_argument_group('logging', description='Logging arguments')
-    # model_args.add_argument('--log_level', choices=logging.getLevelNamesMapping().keys(), default=logging.INFO, help='Log level')
+    model_args = parser.add_argument_group('logging', description='Logging arguments')
+    model_args.add_argument('--wandb_project', type=str, default=None, help='WandB project name')
+    model_args.add_argument('--wandb_exp', type=str, default=None, help='WandB experiment name')
+    model_args.add_argument('--wandb_tags', type=str, nargs='+', default=[], help='WandB tags')
 
     return parser
 
@@ -134,10 +172,14 @@ if __name__ == '__main__':
     )
     model.to(device)
 
-    trainer = get_trainer(model, args, device=device)
+    trainer, optimizer = get_trainer(model, args, device=device)
     evaluator = get_evaluator(model, args, device=device)
+
     progress = ProgressBar(persist=True)
     progress.attach(trainer, event_name=Events.EPOCH_COMPLETED, closing_event_name=Events.COMPLETED)
+
+    if args.wandb_project is not None:
+        setup_wandb_logger(args, trainer, evaluator, optimizer)
 
     @trainer.on(Events.EPOCH_COMPLETED)
     def log_validation_metrics(trainer: Engine):

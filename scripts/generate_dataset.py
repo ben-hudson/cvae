@@ -117,4 +117,4 @@ if __name__ == '__main__':
     del metadata['save_path']
     dataset.attrs = metadata
 
-    dataset.to_netcdf(args.save_path)
+    dataset.to_netcdf(args.save_path, engine='scipy')

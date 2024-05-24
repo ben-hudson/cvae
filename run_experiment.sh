@@ -11,8 +11,8 @@ echo "Date:     $(date)"
 echo "Hostname: $(hostname)"
 
 module --quiet purge
-module --quiet load anaconda/3
-module --quiet load cuda/11.7
+module --quiet load miniconda/3
+module --quiet load cuda/11.8
 
 # Load environment variables
 source .env
@@ -20,25 +20,23 @@ source .env
 # Fixes issues with MIG-ed GPUs with versions of PyTorch < 2.0
 unset CUDA_VISIBLE_DEVICES
 
-conda activate causality-course-project
+conda activate cvae
 
-if [ $# -lt 2 ]; then
-    echo "Pass an experiment, dataset name"
+if [ $# -lt 1 ]; then
+    echo "Pass an experiment name"
     exit 1
 fi
 EXP_NAME=${1}
-DATASET=${2}
+DATASET=taxi_4_1000000_3dimsintervention.nc
 EXTRA_ARGS=${@:3}
 
-RESULTS_DIR=$HOME/causality-course-project/results/$DATASET/$EXP_NAME
-DATAROOT=$SCRATCH/causality-course-project/datasets
+RESULTS_DIR=$HOME/cvae/results/$DATASET/$EXP_NAME
+DATAROOT=$SCRATCH/taxi_dataset
 
 cp $DATAROOT/$DATASET $SLURM_TMPDIR
 mkdir -p $SLURM_TMPDIR/results
 
-python disentanglement_via_mechanism_sparsity/baseline_models/cvae/train.py --dataroot $SLURM_TMPDIR --dataset $DATASET --output_dir $SLURM_TMPDIR/results \
-    --z_dim 8 --hidden_dim 64 --time_limit 3 \
-    --comet_key $COMET_API_KEY --comet_workspace $COMET_WORKSPACE --comet_project_name $COMET_PROJECT --comet_tag $EXP_NAME $EXTRA_ARGS
+python scripts/train.py $SLURM_TMPDIR/$DATASET --latent_dim_to_gt --kld_weight 0.001  --wandb_project learn_2ssps --wandb_exp $EXP_NAME $EXTRA_ARGS
 
 mkdir -p $RESULTS_DIR
 mv $SLURM_TMPDIR/results/* $RESULTS_DIR
