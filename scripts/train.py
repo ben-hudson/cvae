@@ -4,7 +4,8 @@ import pathlib
 import torch
 
 from collections import namedtuple
-from cvae import CVAE
+from models.cvae import CVAE
+from models.solver_vae import SolverVAE
 from ignite.contrib.metrics import GpuInfo
 from ignite.engine import Engine, Events
 from ignite.handlers import Checkpoint, DiskSaver, TerminateOnNan, TimeLimit, ProgressBar
@@ -143,6 +144,7 @@ def get_argparser():
     train_args.add_argument('--max_hours', type=int, default=3, help='Maximum hours to train')
 
     model_args = parser.add_argument_group('model', description='Model arguments')
+    model_args.add_argument('--model', type=str, choices=['cvae', 'solver_vae'], default='cvae', help='Model to use')
     model_args.add_argument('--latent_dim', type=int, default=10, help='Model latent dimension')
     model_args.add_argument('--latent_dim_to_gt', action='store_true', help='Set model latent dimension to ground truth')
     model_args.add_argument('--hidden_dim', type=int, default=64, help='Hidden dimension in model MLPs')
@@ -164,12 +166,22 @@ if __name__ == '__main__':
     device = 'cuda:0' if torch.cuda.is_available() and not args.no_gpu else 'cpu'
 
     obs, cond, latent = train_set[0]
-    model = CVAE(
-        obs.shape[0],
-        cond.shape[0],
-        latent.shape[0] if args.latent_dim_to_gt else args.latent_dim,
-        args.hidden_dim
-    )
+    if args.model == 'cvae':
+        model = CVAE(
+            obs.shape[0],
+            cond.shape[0],
+            latent.shape[0] if args.latent_dim_to_gt else args.latent_dim,
+            args.hidden_dim
+        )
+    elif args.model == 'solver_vae':
+        model = SolverVAE(
+            obs.shape[0],
+            cond.shape[0],
+            latent.shape[0] if args.latent_dim_to_gt else args.latent_dim,
+            args.hidden_dim
+        )
+    else:
+        raise ValueError(f'unknown model {args.model}')
     model.to(device)
 
     trainer, optimizer = get_trainer(model, args, device=device)
