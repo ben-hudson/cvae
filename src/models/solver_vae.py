@@ -17,24 +17,27 @@ class Encoder(nn.Module):
 
         # W is a d_y*d_h binary matrix
         # we model W_ij with a bernoulli distribution
-        self.W_logit = nn.Sequential(
+        self.W_logits = nn.Sequential(
             nn.Linear(hidden_dim_2, cost_dim*constr_dim),
             nn.Unflatten(-1, (constr_dim, cost_dim))
         )
 
-        self.h_mean = nn.Linear(hidden_dim_2, constr_dim)
-        self.h_logvar = nn.Linear(hidden_dim_2, constr_dim)
+        self.h_shape = nn.Linear(hidden_dim_2, constr_dim)
+        self.h_rate = nn.Linear(hidden_dim_2, constr_dim)
 
-        self.q_mean = nn.Linear(hidden_dim_2, cost_dim)
-        self.q_logvar = nn.Linear(hidden_dim_2, cost_dim)
+        self.q_shape = nn.Linear(hidden_dim_2, cost_dim)
+        self.q_rate = nn.Linear(hidden_dim_2, cost_dim)
 
-    def forward(self, x: torch.Tensor, eps: float = 1e-8):
+    def forward(self, x: torch.Tensor):
         hidden = F.silu(self.fc1(x))
         hidden = F.silu(self.fc2(hidden))
 
-        W = ReparametrizedBernoulli(logits=self.W_logit(hidden))
-        h = Normal(F.softplus(self.h_mean(hidden)), torch.exp(self.h_logvar(hidden) + eps))
-        q = Normal(F.softplus(self.q_mean(hidden)), torch.exp(self.q_logvar(hidden) + eps))
+        W = ReparametrizedBernoulli(logits=self.W_logits(hidden))
+        # W = F.gumbel_softmax(self.W_logits(hidden), tau=1, hard=True)
+        # h = Normal(F.softplus(self.h_shape(hidden)), torch.exp(self.h_rate(hidden) + eps))
+        # q = Normal(F.softplus(self.q_shape(hidden)), torch.exp(self.q_rate(hidden) + eps))
+        h = Gamma(F.softplus(self.h_shape(hidden)), F.softplus(self.h_rate(hidden)))
+        q = Gamma(F.softplus(self.q_shape(hidden)), F.softplus(self.q_rate(hidden)))
 
         return W, h, q
 
@@ -50,12 +53,13 @@ class CvxSolver(nn.Module):
         assert problem.is_dpp(), f'Problem is not DPP'
 
         self.solver = CvxpyLayer(problem, parameters=[A, b, c], variables=[x])
-        # learnable output transformation so we don't have to worry about permutation and scaling of learned problem
-        self.output_trans = nn.Linear(cost_dim, cost_dim)
+        # learnable output transformation so we don't have to worry about rotation of learned problem
+        # self.output_trans = nn.Linear(cost_dim, cost_dim)
 
     def forward(self, A, b, c):
         solution, = self.solver(A, b, c)
-        return self.output_trans(solution)
+        # return self.output_trans(solution)
+        return solution
 
 
 class SolverVAE(nn.Module):
@@ -68,31 +72,23 @@ class SolverVAE(nn.Module):
         self.recognition_net = Encoder(y_dim + x_dim, y_dim, constr_dim, hidden_dim, hidden_dim // 2)
         self.generation_net = CvxSolver(y_dim, constr_dim)
 
-    def sample(self, condition: torch.Tensor):
+    def sample(self, x: torch.Tensor):
         # first, get the conditioned latent distribution p(z|x)
-        W, h, q = self.prior_net(condition)
+        W, h, q = self.prior_net(x)
         # take some samples
-        # these must be greater than 0 for the problem definition to be valid!
-        W_sample = F.softplus(W.rsample())
-        h_sample = F.softplus(h.rsample())
-        q_sample = F.softplus(q.rsample())
+        # these must be greater or equal to 0 for the problem definition to be valid!
+        W_sample = W.rsample(tau=1)
+        h_sample = h.rsample()
+        q_sample = q.rsample().clamp(1e-3) # must be greater than 0 or problem is unbounded
         # and try to reconstruct the observation p(y|x,z)
         y_sample = self.generation_net(W_sample, h_sample, q_sample)
         return (W, h, q), y_sample
 
-    def forward(self, obs: torch.Tensor, condition: torch.Tensor):
+    def forward(self, y: torch.Tensor, x: torch.Tensor):
         # get prior from condition p(z|x), and try to reconstruct observation
-        priors, obs_hat = self.sample(condition)
+        priors, y_hat = self.sample(x)
         # now, we need to get the posterior q(z|x,y)
-        x = torch.cat([obs, condition], dim=1)
-        posteriors = self.recognition_net(x)
+        obs = torch.cat([y, x], dim=1)
+        posteriors = self.recognition_net(obs)
 
-        # want reconstructed observation to be close to the observation
-        # is actually doesn't make sense to use MSE because of the permutation (see output_trans in generation_net)
-        mse = F.mse_loss(obs_hat, obs).sum()
-        # want posterior to be close to the prior
-        kld = torch.zeros(1, device=self._device_param.device)
-        for p, q in zip(priors, posteriors):
-            kld += kl_divergence(p, q).sum()
-
-        return priors, posteriors, obs_hat, mse, kld
+        return priors, posteriors, y_hat

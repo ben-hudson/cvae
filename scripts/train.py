@@ -2,6 +2,7 @@ import argparse
 import numpy as np
 import pathlib
 import torch
+import torch.nn.functional as F
 
 from collections import namedtuple
 from models.cvae import CVAE
@@ -13,7 +14,9 @@ from ignite.metrics import RunningAverage
 from metrics import mean_corr_coef_np as mcc_score, r2_score
 from taxi.allocation_env import AllocationDataset
 from torch.utils.data import DataLoader, Subset
+from torch.distributions import kl_divergence
 from typing import Tuple
+
 
 TrainState = namedtuple('TrainState', ['kld', 'mse', 'loss'])
 EvalState = namedtuple('EvalState', ['r2', 'mcc'])
@@ -48,9 +51,19 @@ def get_trainer(model: torch.nn.Module, args: namedtuple, device='cpu') -> Tuple
         model.train()
         optimizer.zero_grad()
 
-        action, obs = batch[0].to(device), batch[1].to(device)
+        x, y, W, h, q = batch
+        x, y = x.float().to(device), y.float().to(device)
 
-        _, _, _, mse, kld = model(obs, action)
+        priors, posteriors, y_hat = model(y, x)
+
+        # is actually doesn't make sense to use MSE because of the permutation (see output_trans in generation_net)
+        # but fuck it we're gonna minimize it anyway
+        mse = F.mse_loss(y_hat, y).sum()
+        # want posterior to be close to the prior
+        kld = torch.zeros(1, device=device)
+        for p, q in zip(priors, posteriors):
+            kld += kl_divergence(p, q).sum()
+
         loss = args.kld_weight*kld + (1 - args.kld_weight)*mse
         loss.backward()
         optimizer.step()
@@ -72,17 +85,13 @@ def get_evaluator(model: torch.nn.Module, args: namedtuple, device='cpu'):
     def eval_step(evaluator: Engine, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
         model.eval()
         with torch.no_grad():
-            action, obs = batch[0].to(device), batch[1].to(device)
-            latents = batch[2:]
+            x, y, W, h, q = batch
+            x, = x.float().to(device)
 
-            priors, _ = model.sample(action)
+            priors, y_hat = model.sample(x)
 
             r2 = torch.zeros(1)
             mcc = torch.zeros(1)
-            for z, p in zip(latents, priors):
-                p_loc = p.loc.cpu()
-                r2 += r2_score(z, p_loc)
-                mcc += mcc_score(z, p_loc)
 
             return EvalState(r2, mcc)
 
@@ -107,12 +116,6 @@ def setup_wandb_logger(args: namedtuple, trainer: Engine, evaluator: Engine, opt
         tag='Training',
         metric_names='all'
     )
-
-    # wandb_logger.attach_opt_params_handler(
-    #     trainer,
-    #     event_name=Events.ITERATION_STARTED,
-    #     optimizer=optimizer,
-    # )
 
     wandb_logger.attach_output_handler(
         evaluator,
@@ -171,19 +174,19 @@ if __name__ == '__main__':
 
     device = 'cuda:0' if torch.cuda.is_available() and not args.no_gpu else 'cpu'
 
-    obs, cond, latent = train_set[0]
+    x, y, _, h, _ = train_set[0]
     if args.model == 'cvae':
         model = CVAE(
-            obs.shape[0],
-            cond.shape[0],
-            latent.shape[0] if args.latent_dim_to_gt else args.latent_dim,
+            y.shape[0],
+            x.shape[0],
+            h.shape[0] if args.latent_dim_to_gt else args.latent_dim,
             args.hidden_dim
         )
     elif args.model == 'solver_vae':
         model = SolverVAE(
-            obs.shape[0],
-            cond.shape[0],
-            latent.shape[0] if args.latent_dim_to_gt else args.latent_dim,
+            y.shape[0],
+            x.shape[0],
+            h.shape[0] if args.latent_dim_to_gt else args.latent_dim,
             args.hidden_dim
         )
     else:
@@ -195,16 +198,16 @@ if __name__ == '__main__':
 
     progress = ProgressBar(persist=True)
     # progress.attach(trainer, event_name=Events.EPOCH_COMPLETED, closing_event_name=Events.COMPLETED)
-    progress.attach(trainer, event_name=Events.ITERATION_COMPLETED, closing_event_name=Events.COMPLETED)
+    progress.attach(trainer, event_name=Events.EPOCH_COMPLETED, closing_event_name=Events.COMPLETED, metric_names='all')
 
     if args.wandb_project is not None:
         setup_wandb_logger(args, trainer, evaluator, optimizer)
 
-    @trainer.on(Events.EPOCH_COMPLETED)
-    def log_validation_metrics(trainer: Engine):
-        evaluator.run(val_loader)
-        # hacky, but the only way to get trainer and evaluator metrics on the same bar
-        metrics = dict(**trainer.state.metrics, **evaluator.state.metrics)
-        progress.pbar.set_postfix(metrics)
+    # @trainer.on(Events.ITERATION_COMPLETED)
+    # def log_validation_metrics(trainer: Engine):
+    #     evaluator.run(val_loader)
+    #     # hacky, but the only way to get trainer and evaluator metrics on the same bar
+    #     metrics = dict(**trainer.state.metrics, **evaluator.state.metrics)
+    #     progress.pbar.set_postfix(metrics)
 
     trainer.run(train_loader, max_epochs=args.max_epochs)

@@ -16,7 +16,7 @@ class AllocationDataset(torch.utils.data.Dataset):
         self.length = n_samples
 
         self.env = AllocationEnv(n_nodes, n_producers, n_consumers)
-        self.x = torch.distributions.Uniform(0, 10).sample((n_producers, n_samples))
+        self.x = torch.distributions.Uniform(1, 10).sample((n_samples, n_producers))
 
     def __len__(self):
         return self.length
@@ -82,7 +82,7 @@ class AllocationEnv(gym.Env):
     def step(self, capacity):
         capacity = capacity.numpy()
         demand = self.demand_dist.sample().numpy()
-        cost = self.cost_dist.sample().numpy()
+        cost = self.cost_dist.sample().clamp(1e-3).numpy() # cost must be > 0 or problem is unbounded
 
         model = self.formulate_allocation_problem(capacity, demand, cost)
         assert model.optimize() == mip.OptimizationStatus.OPTIMAL, f'Did not find the optimal solution, status was {model.status}'
@@ -98,21 +98,21 @@ class AllocationEnv(gym.Env):
 
         return obs, Q, terminated, truncated, latents
 
-    def formulate_allocation_problem(self, capacity, demand, cost, unused_penalty=1, unsrvd_penalty=1e6):
+    def formulate_allocation_problem(self, capacity, demand, cost, unused_penalty=0, unsrvd_penalty=1e6):
         model = mip.Model(sense=mip.MINIMIZE, solver_name=mip.CBC)
         model.verbose = 0
 
         y = model.add_var_tensor((self.n_producers, self.n_consumers), name='y', var_type='C', lb=0)
-        y_unused = model.add_var(name='y_unused', var_type='C', lb=0)
-        y_unsrvd = model.add_var(name='y_unsrvd', var_type='C', lb=0)
+        y_unused = model.add_var_tensor((self.n_producers, ), name='y_unused', var_type='C', lb=0)
+        y_unsrvd = model.add_var_tensor((self.n_consumers, ), name='y_unsrvd', var_type='C', lb=0)
 
         for n in range(self.n_producers):
-            model += mip.xsum(y[n, :]) + y_unused == capacity[n]
+            model += mip.xsum(y[n, :]) + y_unused[n] == capacity[n]
 
         for n in range(self.n_consumers):
-            model += mip.xsum(y[:, n]) + y_unsrvd == demand[n]
+            model += mip.xsum(y[:, n]) + y_unsrvd[n] == demand[n]
 
-        model += mip.xsum(cost * y.flatten()) + unused_penalty*y_unused + unsrvd_penalty*y_unsrvd
+        model += mip.xsum(cost * y.flatten()) + mip.xsum(unused_penalty*y_unused) + mip.xsum(unsrvd_penalty*y_unsrvd)
         return model
 
     def get_slack_form(self, model):
