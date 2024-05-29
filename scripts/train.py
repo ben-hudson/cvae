@@ -11,7 +11,7 @@ from ignite.engine import Engine, Events
 from ignite.handlers import Checkpoint, DiskSaver, TerminateOnNan, TimeLimit, ProgressBar
 from ignite.metrics import RunningAverage
 from metrics import mean_corr_coef_np as mcc_score, r2_score
-from taxi.dataset import TaxiDataset
+from taxi.allocation_env import AllocationDataset
 from torch.utils.data import DataLoader, Subset
 from typing import Tuple
 
@@ -29,14 +29,14 @@ def pairwise(iterable):
         a = b
 
 def get_datasets(args):
-    dataset = TaxiDataset(args.path, no_norm=args.no_norm, latent_cost=args.latent_cost, obs_slack=args.obs_slack)
+    dataset = AllocationDataset(args.n_nodes, args.n_producers, args.n_consumers, args.samples)
 
-    total_samples = len(dataset)
-    indices = np.arange(total_samples).tolist() # dataloader shuffles, don't need to here
+    samples = len(dataset)
+    indices = np.arange(samples).tolist() # dataloader shuffles, don't need to here
     split = np.array([0, args.train_frac, args.val_frac, args.test_frac])
     assert np.isclose(split.sum(), 1), f'train-val-test split does not sum to 1, it sums to {split.sum()}'
 
-    split_indices = np.cumsum(split*total_samples).astype(int)
+    split_indices = np.cumsum(split*samples).astype(int)
     subsets = tuple(Subset(dataset, indices[start:end]) for start, end in pairwise(split_indices))
     return subsets
 
@@ -48,10 +48,9 @@ def get_trainer(model: torch.nn.Module, args: namedtuple, device='cpu') -> Tuple
         model.train()
         optimizer.zero_grad()
 
-        obs, cond, latent = batch
-        obs, cond = obs.to(device), cond.to(device)
+        action, obs = batch[0].to(device), batch[1].to(device)
 
-        prior, posterior, obs_hat, mse, kld = model(obs, cond)
+        _, _, _, mse, kld = model(obs, action)
         loss = args.kld_weight*kld + (1 - args.kld_weight)*mse
         loss.backward()
         optimizer.step()
@@ -73,14 +72,17 @@ def get_evaluator(model: torch.nn.Module, args: namedtuple, device='cpu'):
     def eval_step(evaluator: Engine, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
         model.eval()
         with torch.no_grad():
-            obs, cond, latent = batch
-            obs, cond = obs.to(device), cond.to(device)
+            action, obs = batch[0].to(device), batch[1].to(device)
+            latents = batch[2:]
 
-            prior, obs_hat = model.sample(cond)
-            prior_mean = prior.loc.cpu()
+            priors, _ = model.sample(action)
 
-            r2 = r2_score(latent, prior_mean)
-            mcc = mcc_score(latent, prior_mean)
+            r2 = torch.zeros(1)
+            mcc = torch.zeros(1)
+            for z, p in zip(latents, priors):
+                p_loc = p.loc.cpu()
+                r2 += r2_score(z, p_loc)
+                mcc += mcc_score(z, p_loc)
 
             return EvalState(r2, mcc)
 
@@ -124,11 +126,15 @@ def setup_wandb_logger(args: namedtuple, trainer: Engine, evaluator: Engine, opt
 
 def get_argparser():
     parser = argparse.ArgumentParser('Train CVAE on a dataset')
+
+    env_args = parser.add_argument_group('env', description='Environment arguments')
+    env_args.add_argument('--n_nodes', type=int, default=4, help='Number of nodes in the network')
+    env_args.add_argument('--n_consumers', type=int, default=2, help='Number of producers in the allocation problem')
+    env_args.add_argument('--n_producers', type=int, default=2, help='Number of consumers in the allocation problem')
+
     dataset_args = parser.add_argument_group('dataset', description='Dataset arguments')
     dataset_args.add_argument('path', type=pathlib.Path, help='Path to dataset')
-    dataset_args.add_argument('--no_norm', action='store_true', help='Do not convert the dataset to unit variance')
-    dataset_args.add_argument('--latent_cost', action='store_true', help='Include cost coefficients q in the ground truth latents')
-    dataset_args.add_argument('--obs_slack', action='store_true', help='Include slack variables in the observations')
+    dataset_args.add_argument('--samples', type=int, default=10 ** 6, help='Number of samples to draw from the environment')
     dataset_args.add_argument('--train_frac', type=float, default=0.8, help='Fraction of dataset used for training')
     dataset_args.add_argument('--val_frac', type=float, default=0.1, help='Fraction of dataset used for validation')
     dataset_args.add_argument('--test_frac', type=float, default=0.1, help='Fraction of dataset used for testing')

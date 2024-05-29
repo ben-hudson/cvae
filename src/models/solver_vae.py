@@ -85,7 +85,7 @@ class SolverVAE(nn.Module):
         priors, obs_hat = self.sample(condition)
         # now, we need to get the posterior q(z|x,y)
         x = torch.cat([obs, condition], dim=1)
-        posteriors = self.recognition_net(  x)
+        posteriors = self.recognition_net(x)
 
         # want reconstructed observation to be close to the observation
         # is actually doesn't make sense to use MSE because of the permutation (see output_trans in generation_net)
