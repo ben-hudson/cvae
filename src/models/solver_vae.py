@@ -61,6 +61,9 @@ class CvxSolver(nn.Module):
 class SolverVAE(nn.Module):
     def __init__(self, y_dim: int, x_dim: int, constr_dim: int, hidden_dim: int) -> None:
         super(SolverVAE, self).__init__()
+
+        self._device_param = nn.Parameter(torch.empty(0)) # https://stackoverflow.com/a/63477353/
+
         self.prior_net = Encoder(x_dim, y_dim, constr_dim, hidden_dim, hidden_dim // 2)
         self.recognition_net = Encoder(y_dim + x_dim, y_dim, constr_dim, hidden_dim, hidden_dim // 2)
         self.generation_net = CvxSolver(y_dim, constr_dim)
@@ -88,7 +91,7 @@ class SolverVAE(nn.Module):
         # is actually doesn't make sense to use MSE because of the permutation (see output_trans in generation_net)
         mse = F.mse_loss(obs_hat, obs).sum()
         # want posterior to be close to the prior
-        kld = torch.zeros(1)
+        kld = torch.zeros(1, device=self._device_param.device)
         for p, q in zip(priors, posteriors):
             kld += kl_divergence(p, q).sum()
 

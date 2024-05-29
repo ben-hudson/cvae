@@ -188,7 +188,8 @@ if __name__ == '__main__':
     evaluator = get_evaluator(model, args, device=device)
 
     progress = ProgressBar(persist=True)
-    progress.attach(trainer, event_name=Events.EPOCH_COMPLETED, closing_event_name=Events.COMPLETED)
+    # progress.attach(trainer, event_name=Events.EPOCH_COMPLETED, closing_event_name=Events.COMPLETED)
+    progress.attach(trainer, event_name=Events.ITERATION_COMPLETED, closing_event_name=Events.COMPLETED)
 
     if args.wandb_project is not None:
         setup_wandb_logger(args, trainer, evaluator, optimizer)

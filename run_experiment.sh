@@ -3,31 +3,25 @@
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=4G
 #SBATCH --time=03:15:00
-#SBATCH --output /network/scratch/b/ben.hudson/slurm-%j.out
-#SBATCH --error /network/scratch/b/ben.hudson/slurm-%j.err
+#SBATCH --output /network/scratch/b/ben.hudson/slurm/%j.out
+#SBATCH --error /network/scratch/b/ben.hudson/slurm/%j.err
 
 set -e  # exit on error
 echo "Date:     $(date)"
 echo "Hostname: $(hostname)"
 
 module --quiet purge
-module --quiet load miniconda/3
+module --quiet load python/3.10
 module --quiet load cuda/11.8
 
-# Load environment variables
-source .env
-
-# Fixes issues with MIG-ed GPUs with versions of PyTorch < 2.0
-unset CUDA_VISIBLE_DEVICES
-
-conda activate cvae
+source .venv/bin/activate
 
 if [ $# -lt 1 ]; then
     echo "Pass an experiment name"
     exit 1
 fi
 EXP_NAME=${1}
-DATASET=taxi_4_1000000_3dimsintervention.nc
+DATASET=taxi_4_1000000_3dimsintervention_2.nc
 EXTRA_ARGS=${@:2}
 
 RESULTS_DIR=$HOME/cvae/results/$DATASET/$EXP_NAME
