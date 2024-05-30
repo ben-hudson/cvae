@@ -5,12 +5,20 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "Python Debugger: Current File with Arguments",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": "${command:pickArgs}"
+        },
+        {
             "name": "Python Debugger: train.py",
             "type": "debugpy",
             "request": "launch",
             "program": "scripts/train.py",
             "console": "integratedTerminal",
-            "args": "datasets/taxi_4_1000000_3dimsintervention.nc --latent_dim_to_gt --kld_weight 0.001"
+            "args": "--model solver_vae --latent_dim_to_gt --kld_weight 0.01 --workers 1"
         }
     ]
 }

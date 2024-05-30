@@ -5,32 +5,39 @@ import torch.nn.functional as F
 
 from cvxpylayers.torch import CvxpyLayer
 from distributions import ReparametrizedBernoulli
-from ilop.linprog_solver import linprog_batch_std
-from torch.distributions import Normal, Gamma, kl_divergence
+from torch.distributions import Normal, Gamma
+from torchvision.ops import MLP
+from typing import List
 
 class Encoder(nn.Module):
-    def __init__(self, input_dim, cost_dim, constr_dim, hidden_dim_1, hidden_dim_2):
+    def __init__(self, input_dim: int, cost_dim: int, constr_dim: int, max_hidden_dim: int):
         super().__init__()
 
-        self.fc1 = nn.Linear(input_dim, hidden_dim_1)
-        self.fc2 = nn.Linear(hidden_dim_1, hidden_dim_2)
+        layers = []
+        max_out_dim = cost_dim*constr_dim # W input is this dimension
+        hidden_dims = _generate_hidden_dims(input_dim, max_out_dim, max_hidden_dim)
+        for hidden_dim in hidden_dims:
+            layers.append(torch.nn.Linear(input_dim, hidden_dim))
+            layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.SiLU())
+            input_dim = hidden_dim
+        self.mlp = nn.Sequential(*layers)
 
         # W is a d_y*d_h binary matrix
         # we model W_ij with a bernoulli distribution
         self.W_logits = nn.Sequential(
-            nn.Linear(hidden_dim_2, cost_dim*constr_dim),
+            nn.Linear(hidden_dims[-1], cost_dim*constr_dim),
             nn.Unflatten(-1, (constr_dim, cost_dim))
         )
 
-        self.h_shape = nn.Linear(hidden_dim_2, constr_dim)
-        self.h_rate = nn.Linear(hidden_dim_2, constr_dim)
+        self.h_shape = nn.Linear(hidden_dims[-1], constr_dim)
+        self.h_rate = nn.Linear(hidden_dims[-1], constr_dim)
 
-        self.q_shape = nn.Linear(hidden_dim_2, cost_dim)
-        self.q_rate = nn.Linear(hidden_dim_2, cost_dim)
+        self.q_shape = nn.Linear(hidden_dims[-1], cost_dim)
+        self.q_rate = nn.Linear(hidden_dims[-1], cost_dim)
 
     def forward(self, x: torch.Tensor):
-        hidden = F.silu(self.fc1(x))
-        hidden = F.silu(self.fc2(hidden))
+        hidden = self.mlp(x)
 
         W = ReparametrizedBernoulli(logits=self.W_logits(hidden))
         # W = F.gumbel_softmax(self.W_logits(hidden), tau=1, hard=True)
@@ -54,22 +61,31 @@ class CvxSolver(nn.Module):
 
         self.solver = CvxpyLayer(problem, parameters=[A, b, c], variables=[x])
         # learnable output transformation so we don't have to worry about rotation of learned problem
-        # self.output_trans = nn.Linear(cost_dim, cost_dim)
+        self.output_trans = nn.Linear(cost_dim, cost_dim)
 
     def forward(self, A, b, c):
         solution, = self.solver(A, b, c)
-        # return self.output_trans(solution)
-        return solution
+        return self.output_trans(solution)
+        # return solution
+
+def _generate_hidden_dims(in_dim: int, out_dim: int, max_hidden_dim: int):
+    min_hidden_dim = min(in_dim, out_dim)
+    hidden_dims = [max_hidden_dim]
+    while hidden_dims[-1] // 2 > min_hidden_dim:
+        hidden_dims.append(hidden_dims[-1] // 2)
+
+    if in_dim < out_dim:
+        hidden_dims = list(reversed(hidden_dims))
+
+    return hidden_dims
 
 
 class SolverVAE(nn.Module):
-    def __init__(self, y_dim: int, x_dim: int, constr_dim: int, hidden_dim: int) -> None:
+    def __init__(self, y_dim: int, x_dim: int, constr_dim: int, max_hidden_dim: int) -> None:
         super(SolverVAE, self).__init__()
 
-        self._device_param = nn.Parameter(torch.empty(0)) # https://stackoverflow.com/a/63477353/
-
-        self.prior_net = Encoder(x_dim, y_dim, constr_dim, hidden_dim, hidden_dim // 2)
-        self.recognition_net = Encoder(y_dim + x_dim, y_dim, constr_dim, hidden_dim, hidden_dim // 2)
+        self.prior_net = Encoder(x_dim, y_dim, constr_dim, max_hidden_dim)
+        self.recognition_net = Encoder(y_dim + x_dim, y_dim, constr_dim, max_hidden_dim)
         self.generation_net = CvxSolver(y_dim, constr_dim)
 
     def sample(self, x: torch.Tensor):

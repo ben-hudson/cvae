@@ -1,6 +1,5 @@
 import argparse
 import numpy as np
-import pathlib
 import torch
 import torch.nn.functional as F
 
@@ -15,21 +14,26 @@ from metrics import mean_corr_coef_np as mcc_score, r2_score
 from taxi.allocation_env import AllocationDataset
 from torch.utils.data import DataLoader, Subset
 from torch.distributions import kl_divergence
-from typing import Tuple
-
+from typing import Tuple, List
+from itertools import pairwise
+from sklearn.preprocessing import StandardScaler
 
 TrainState = namedtuple('TrainState', ['kld', 'mse', 'loss'])
-EvalState = namedtuple('EvalState', ['r2', 'mcc'])
+# EvalState = namedtuple('EvalState', ['r2', 'mcc'])
+EvalState = namedtuple('EvalState', ['y', 'y_hat', 'q', 'q_hat', 'W', 'W_hat', 'h', 'h_hat'])
 
-# pairwise is available in itertools in Python 3.10+
-# https://docs.python.org/3/library/itertools.html#itertools.pairwise
-def pairwise(iterable):
-    # pairwise('ABCDEFG') → AB BC CD DE EF FG
-    iterator = iter(iterable)
-    a = next(iterator, None)
-    for b in iterator:
-        yield a, b
-        a = b
+def transform_batch(scalers, batch):
+    for tensor, scaler in zip(batch, scalers):
+        flat_tensor = tensor.reshape(args.batch_size, -1)
+        scaler.partial_fit(flat_tensor)
+        scaled_tensor = scaler.transform(flat_tensor).reshape(tensor.shape)
+        yield torch.Tensor(scaled_tensor)
+
+def untransform_batch(scalers, batch):
+    for scaled_tensor, scaler in zip(batch, scalers):
+        flat_tensor = scaled_tensor.reshape(args.batch_size, -1)
+        tensor = scaler.inverse_transform(flat_tensor).reshape(scaled_tensor.shape)
+        yield torch.Tensor(tensor)
 
 def get_datasets(args):
     dataset = AllocationDataset(args.n_nodes, args.n_producers, args.n_consumers, args.samples)
@@ -43,7 +47,7 @@ def get_datasets(args):
     subsets = tuple(Subset(dataset, indices[start:end]) for start, end in pairwise(split_indices))
     return subsets
 
-def get_trainer(model: torch.nn.Module, args: namedtuple, device='cpu') -> Tuple[Engine, torch.optim.Optimizer]:
+def get_trainer(model: torch.nn.Module, scalers: List[StandardScaler], args: namedtuple, device='cpu') -> Tuple[Engine, torch.optim.Optimizer]:
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
 
     assert args.kld_weight >= 0 and args.kld_weight <= 1, f'kld weight must be between 0 and 1, it is {args.kld_weight}'
@@ -51,13 +55,12 @@ def get_trainer(model: torch.nn.Module, args: namedtuple, device='cpu') -> Tuple
         model.train()
         optimizer.zero_grad()
 
-        x, y, W, h, q = batch
+        x, y, W, h, q = transform_batch(scalers, batch)
         x, y = x.float().to(device), y.float().to(device)
 
         priors, posteriors, y_hat = model(y, x)
 
         # is actually doesn't make sense to use MSE because of the permutation (see output_trans in generation_net)
-        # but fuck it we're gonna minimize it anyway
         mse = F.mse_loss(y_hat, y).sum()
         # want posterior to be close to the prior
         kld = torch.zeros(1, device=device)
@@ -74,30 +77,29 @@ def get_trainer(model: torch.nn.Module, args: namedtuple, device='cpu') -> Tuple
     RunningAverage(output_transform=lambda state: state.kld).attach(trainer, 'KLD')
     RunningAverage(output_transform=lambda state: state.mse).attach(trainer, 'MSE')
     RunningAverage(output_transform=lambda state: state.loss).attach(trainer, 'Loss')
-    if device != 'cpu':
-        GpuInfo().attach(trainer, name='gpu')
     trainer.add_event_handler(Events.ITERATION_COMPLETED, TerminateOnNan())
     trainer.add_event_handler(Events.ITERATION_COMPLETED, TimeLimit(limit_sec=args.max_hours*3600))
 
     return trainer, optimizer
 
-def get_evaluator(model: torch.nn.Module, args: namedtuple, device='cpu'):
-    def eval_step(evaluator: Engine, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
+def get_evaluator(model: torch.nn.Module, scalers: List[StandardScaler], args: namedtuple, device='cpu'):
+    def eval_step(evaluator, batch):
         model.eval()
         with torch.no_grad():
-            x, y, W, h, q = batch
-            x, = x.float().to(device)
+            x, y, W, h, q = transform_batch(scalers, batch)
+            x, y = x.float().to(device), y.float().to(device)
 
-            priors, y_hat = model.sample(x)
+            _, (W_post, h_post, q_post), y_hat = model(y, x)
+            estimated_batch = (x.cpu(), y_hat.cpu(), q_post.mean.cpu(), W_post.mean.cpu(), h_post.mean.cpu())
+            x_hat, y_hat, W_hat, h_hat, q_hat = untransform_batch(scalers, estimated_batch)
+            # r2 = torch.zeros(1)
+            # mcc = torch.zeros(1)
 
-            r2 = torch.zeros(1)
-            mcc = torch.zeros(1)
-
-            return EvalState(r2, mcc)
+            return EvalState(y.cpu(), y_hat, q, q_hat, W, W_hat, h, h_hat)
 
     evaluator = Engine(eval_step)
-    RunningAverage(output_transform=lambda state: state.r2).attach(evaluator, 'R^2')
-    RunningAverage(output_transform=lambda state: state.mcc).attach(evaluator, 'MCC')
+    # RunningAverage(output_transform=lambda state: state.r2).attach(evaluator, 'R^2')
+    # RunningAverage(output_transform=lambda state: state.mcc).attach(evaluator, 'MCC')
     return evaluator
 
 def setup_wandb_logger(args: namedtuple, trainer: Engine, evaluator: Engine, optimizer: torch.optim.Optimizer):
@@ -136,7 +138,6 @@ def get_argparser():
     env_args.add_argument('--n_producers', type=int, default=2, help='Number of consumers in the allocation problem')
 
     dataset_args = parser.add_argument_group('dataset', description='Dataset arguments')
-    dataset_args.add_argument('path', type=pathlib.Path, help='Path to dataset')
     dataset_args.add_argument('--samples', type=int, default=10 ** 6, help='Number of samples to draw from the environment')
     dataset_args.add_argument('--train_frac', type=float, default=0.8, help='Fraction of dataset used for training')
     dataset_args.add_argument('--val_frac', type=float, default=0.1, help='Fraction of dataset used for validation')
@@ -156,7 +157,7 @@ def get_argparser():
     model_args.add_argument('--model', type=str, choices=['cvae', 'solver_vae'], default='cvae', help='Model to use')
     model_args.add_argument('--latent_dim', type=int, default=10, help='Model latent dimension')
     model_args.add_argument('--latent_dim_to_gt', action='store_true', help='Set model latent dimension to ground truth')
-    model_args.add_argument('--hidden_dim', type=int, default=64, help='Hidden dimension in model MLPs')
+    model_args.add_argument('--hidden_dim', type=int, default=128, help='Hidden dimension in model MLPs')
 
     model_args = parser.add_argument_group('logging', description='Logging arguments')
     model_args.add_argument('--wandb_project', type=str, default=None, help='WandB project name')
@@ -174,7 +175,7 @@ if __name__ == '__main__':
 
     device = 'cuda:0' if torch.cuda.is_available() and not args.no_gpu else 'cpu'
 
-    x, y, _, h, _ = train_set[0]
+    x, y, _, h, _ = batch = train_set[0]
     if args.model == 'cvae':
         model = CVAE(
             y.shape[0],
@@ -193,21 +194,21 @@ if __name__ == '__main__':
         raise ValueError(f'unknown model {args.model}')
     model.to(device)
 
-    trainer, optimizer = get_trainer(model, args, device=device)
-    evaluator = get_evaluator(model, args, device=device)
+    scalers = [StandardScaler() for _ in range(len(batch))]
+
+    trainer, optimizer = get_trainer(model, scalers, args, device=device)
+    evaluator = get_evaluator(model, scalers, args, device=device)
 
     progress = ProgressBar(persist=True)
-    # progress.attach(trainer, event_name=Events.EPOCH_COMPLETED, closing_event_name=Events.COMPLETED)
     progress.attach(trainer, event_name=Events.EPOCH_COMPLETED, closing_event_name=Events.COMPLETED, metric_names='all')
 
-    if args.wandb_project is not None:
-        setup_wandb_logger(args, trainer, evaluator, optimizer)
+    wandb_logger = setup_wandb_logger(args, trainer, evaluator, optimizer) if args.wandb_project is not None else None
 
-    # @trainer.on(Events.ITERATION_COMPLETED)
-    # def log_validation_metrics(trainer: Engine):
-    #     evaluator.run(val_loader)
-    #     # hacky, but the only way to get trainer and evaluator metrics on the same bar
-    #     metrics = dict(**trainer.state.metrics, **evaluator.state.metrics)
-    #     progress.pbar.set_postfix(metrics)
+    @trainer.on(Events.ITERATION_COMPLETED)
+    def log_validation_metrics(trainer: Engine):
+        evaluator.run(val_loader)
+        # hacky, but the only way to get trainer and evaluator metrics on the same bar
+        # metrics = dict(**trainer.state.metrics, **evaluator.state.metrics)
+        # progress.pbar.set_postfix(metrics)
 
     trainer.run(train_loader, max_epochs=args.max_epochs)
