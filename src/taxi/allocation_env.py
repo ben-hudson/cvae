@@ -24,7 +24,7 @@ class AllocationDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         action = self.x[index]
         observation, reward, _, _, latents = self.env.step(action)
-        return action, observation['y'], latents['W'], latents['h'], latents['q']
+        return action, observation['y'], latents['W'], latents['h'], latents['q'], reward
 
 
 class AllocationEnv(gym.Env):
@@ -98,7 +98,7 @@ class AllocationEnv(gym.Env):
 
         return obs, Q, terminated, truncated, latents
 
-    def formulate_allocation_problem(self, capacity, demand, cost, unused_penalty=0, unsrvd_penalty=1e6):
+    def formulate_allocation_problem(self, capacity, demand, cost, unused_penalty=0, unsrvd_penalty=1e3):
         model = mip.Model(sense=mip.MINIMIZE, solver_name=mip.CBC)
         model.verbose = 0
 

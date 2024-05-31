@@ -42,17 +42,22 @@ def get_trainer(model: torch.nn.Module, input_scaler, output_scaler, args: named
         model.train()
         optimizer.zero_grad()
 
-        x, y, W, h, q = batch
+        x, y, W, h, q, Q = batch
 
-        x_scaled = input_scaler.partial_fit(x).transform(x)
-        y_scaled = output_scaler.partial_fit(y).transform(y)
-        x = torch.Tensor(x_scaled).float().to(device)
-        y = torch.Tensor(y_scaled).float().to(device)
+        # x_scaled = input_scaler.partial_fit(x).transform(x)
+        # y_scaled = output_scaler.partial_fit(y).transform(y)
+        # x = torch.Tensor(x_scaled).float().to(device)
+        # y = torch.Tensor(y_scaled).float().to(device)
+        x = x.float().to(device)
+        y = y.float().to(device)
 
-        priors, posteriors, y_hat = model(y, x)
+        priors, posteriors, sample = model(y, x)
+        _, y_sample, W_sample, h_sample, q_sample, Q_sample = sample
 
         # is actually doesn't make sense to use MSE because of the permutation (see output_trans in generation_net)
-        mse = F.mse_loss(y_hat, y).sum()
+        # instead, let's use "cost loss"
+        mse = F.l1_loss(Q_sample, Q).sum()
+        # mse = F.mse_loss(y_sample, y).sum()
         # want posterior to be close to the prior
         kld = torch.zeros(1, device=device)
         for p, q in zip(priors, posteriors):
@@ -77,15 +82,16 @@ def get_evaluator(model: torch.nn.Module, input_scaler, output_scaler, args: nam
     def eval_step(evaluator, batch):
         model.eval()
         with torch.no_grad():
-            x, y, W, h, q = batch
+            x, y, W, h, q, Q = batch
 
-            x_scaled = input_scaler.transform(x)
-            y_scaled = output_scaler.transform(y)
-            x = torch.Tensor(x_scaled).float().to(device)
-            y = torch.Tensor(y_scaled).float().to(device)
+            # x_scaled = input_scaler.transform(x)
+            # y_scaled = output_scaler.transform(y)
+            # x = torch.Tensor(x_scaled).float().to(device)
+            # y = torch.Tensor(y_scaled).float().to(device)
+            y = y.float().to(device)
+            x = x.float().to(device)
 
-            _, (W_post, h_post, q_post), y_hat = model(y, x)
-            W_hat, h_hat, q_hat = W_post.mean, h_post.mean, q_post.mean
+            _, _, (_, y_hat, W_hat, h_hat, q_hat, _) = model(y, x)
 
             # r2 = torch.zeros(1)
             # mcc = torch.zeros(1)
@@ -139,8 +145,8 @@ def get_argparser():
 
     env_args = parser.add_argument_group('env', description='Environment arguments')
     env_args.add_argument('--n_nodes', type=int, default=4, help='Number of nodes in the network')
-    env_args.add_argument('--n_consumers', type=int, default=2, help='Number of producers in the allocation problem')
-    env_args.add_argument('--n_producers', type=int, default=2, help='Number of consumers in the allocation problem')
+    env_args.add_argument('--n_consumers', type=int, default=4, help='Number of producers in the allocation problem')
+    env_args.add_argument('--n_producers', type=int, default=4, help='Number of consumers in the allocation problem')
 
     dataset_args = parser.add_argument_group('dataset', description='Dataset arguments')
     dataset_args.add_argument('--samples', type=int, default=10 ** 6, help='Number of samples to draw from the environment')
@@ -152,7 +158,7 @@ def get_argparser():
 
     train_args = parser.add_argument_group('training', description='Training arguments')
     train_args.add_argument('--no_gpu', action='store_true', help='Do not use the GPU even if one is available')
-    train_args.add_argument('--lr', type=float, default=5e-4, help='Optimizer learning rate')
+    train_args.add_argument('--lr', type=float, default=1e-4, help='Optimizer learning rate')
     train_args.add_argument('--momentum', type=float, default=8e-3, help='Optimizer momentum')
     train_args.add_argument('--kld_weight', type=float, default=0.5, help='Relative weighting of KLD and MSE in training objective')
     train_args.add_argument('--max_epochs', type=int, default=500, help='Maximum number of training epochs')
@@ -181,7 +187,7 @@ if __name__ == '__main__':
 
     device = 'cuda:0' if torch.cuda.is_available() and not args.no_gpu else 'cpu'
 
-    x, y, _, h, _ = batch = train_set[0]
+    x, y, _, h, _, _ = batch = train_set[0]
     if args.model == 'cvae':
         model = CVAE(
             y.shape[0],
@@ -209,11 +215,13 @@ if __name__ == '__main__':
     progress = ProgressBar(persist=True)
     progress.attach(trainer, event_name=Events.EPOCH_COMPLETED, closing_event_name=Events.COMPLETED, metric_names='all')
 
-    wandb_logger = setup_wandb_logger(args, trainer, evaluator, optimizer) #if args.use_wandb else None
+    if args.use_wandb:
+        wandb_logger = setup_wandb_logger(args, trainer, evaluator, optimizer)
 
     @trainer.on(Events.ITERATION_COMPLETED)
     def log_validation_metrics(trainer: Engine):
         evaluator.run(val_loader)
-        log_latents_to_wandb(wandb_logger._wandb, evaluator.state)
+        if args.use_wandb:
+            log_latents_to_wandb(wandb_logger._wandb, evaluator.state)
 
     trainer.run(train_loader, max_epochs=args.max_epochs)

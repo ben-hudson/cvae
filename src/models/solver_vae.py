@@ -9,12 +9,18 @@ from torch.distributions import Normal, Gamma
 from torchvision.ops import MLP
 from typing import List
 
+from ilop.linprog_solver import linprog_batch_std
+
 class Encoder(nn.Module):
-    def __init__(self, input_dim: int, cost_dim: int, constr_dim: int, max_hidden_dim: int):
+    def __init__(self, input_dim: int, y_dim: int, constr_dim: int, max_hidden_dim: int):
         super().__init__()
 
+        constr_cols = y_dim - constr_dim
+        assert constr_cols > 0, 'W ends with an nxn identity matrix, so m > n to have anything to learn.'
+        # constr_cols = y_dim
+
         layers = []
-        max_out_dim = cost_dim*constr_dim # W input is this dimension
+        max_out_dim = max(y_dim, constr_cols*constr_dim)
         hidden_dims = _generate_hidden_dims(input_dim, max_out_dim, max_hidden_dim)
         for hidden_dim in hidden_dims:
             layers.append(torch.nn.Linear(input_dim, hidden_dim))
@@ -23,28 +29,52 @@ class Encoder(nn.Module):
             input_dim = hidden_dim
         self.mlp = nn.Sequential(*layers)
 
-        # W is a d_y*d_h binary matrix
+        # W is a binary matrix
         # we model W_ij with a bernoulli distribution
+        W_dim = constr_cols*constr_dim
         self.W_logits = nn.Sequential(
-            nn.Linear(hidden_dims[-1], cost_dim*constr_dim),
-            nn.Unflatten(-1, (constr_dim, cost_dim))
+            nn.Linear(hidden_dims[-1], W_dim),
+            nn.BatchNorm1d(W_dim),
+            nn.SiLU(),
+            nn.Linear(W_dim, W_dim),
+            nn.BatchNorm1d(W_dim),
+            nn.SiLU(),
+            nn.Unflatten(-1, (constr_dim, constr_cols))
         )
 
-        self.h_shape = nn.Linear(hidden_dims[-1], constr_dim)
-        self.h_rate = nn.Linear(hidden_dims[-1], constr_dim)
+        h_dim = hidden_dims[-1]
+        self.h = nn.Sequential(
+            nn.Linear(hidden_dims[-1], h_dim),
+            nn.BatchNorm1d(h_dim),
+            nn.SiLU(),
+        )
+        self.h_shape = nn.Softplus(nn.Linear(h_dim, constr_dim))
+        self.h_rate = nn.Softplus(nn.Linear(h_dim, constr_dim))
 
-        self.q_shape = nn.Linear(hidden_dims[-1], cost_dim)
-        self.q_rate = nn.Linear(hidden_dims[-1], cost_dim)
+        q_dim = hidden_dims[-1]
+        self.q = nn.Sequential(
+            nn.Linear(hidden_dims[-1], q_dim),
+            nn.BatchNorm1d(q_dim),
+            nn.SiLU(),
+        )
+        self.q_shape = nn.Softplus(nn.Linear(q_dim, y_dim))
+        self.q_rate = nn.Softplus(nn.Linear(q_dim, y_dim))
 
     def forward(self, x: torch.Tensor):
         hidden = self.mlp(x)
 
-        W = ReparametrizedBernoulli(logits=self.W_logits(hidden))
+        W_logits = self.W_logits(hidden)
+        W = ReparametrizedBernoulli(logits=W_logits)
         # W = F.gumbel_softmax(self.W_logits(hidden), tau=1, hard=True)
         # h = Normal(F.softplus(self.h_shape(hidden)), torch.exp(self.h_rate(hidden) + eps))
         # q = Normal(F.softplus(self.q_shape(hidden)), torch.exp(self.q_rate(hidden) + eps))
-        h = Gamma(F.softplus(self.h_shape(hidden)), F.softplus(self.h_rate(hidden)))
-        q = Gamma(F.softplus(self.q_shape(hidden)), F.softplus(self.q_rate(hidden)))
+        h_hidden = self.h(hidden)
+        h_shape, h_rate = self.h_shape(h_hidden), self.h_rate(h_hidden)
+        h = Gamma(h_shape, h_rate)
+
+        q_hidden = self.q(hidden)
+        q_shape, q_rate = self.q_shape(q_hidden), self.q_rate(q_hidden)
+        q = Gamma(q_shape, q_rate)
 
         return W, h, q
 
@@ -52,21 +82,28 @@ class CvxSolver(nn.Module):
     def __init__(self, cost_dim, constr_dim):
         super().__init__()
         # TODO: are all of these nonneg?
-        x = cp.Variable(cost_dim, nonneg=True)
-        c = cp.Parameter(cost_dim, nonneg=True)
-        A = cp.Parameter((constr_dim, cost_dim), nonneg=True)
-        b = cp.Parameter(constr_dim, nonneg=True)
-        problem = cp.Problem(cp.Minimize(c @ x), [A @ x <= b])
+        x = cp.Variable(cost_dim)
+        c = cp.Parameter(cost_dim)
+        A = cp.Parameter((constr_dim, cost_dim))
+        b = cp.Parameter(constr_dim)
+        problem = cp.Problem(cp.Minimize(c @ x), [A @ x == b, x >= 0])
         assert problem.is_dpp(), f'Problem is not DPP'
 
         self.solver = CvxpyLayer(problem, parameters=[A, b, c], variables=[x])
-        # learnable output transformation so we don't have to worry about rotation of learned problem
-        self.output_trans = nn.Linear(cost_dim, cost_dim)
 
     def forward(self, A, b, c):
         solution, = self.solver(A, b, c)
-        return self.output_trans(solution)
-        # return solution
+        return solution
+
+class LinSolver(nn.Module):
+    def __init__(self, cost_dim, constr_dim):
+        super().__init__()
+
+    def forward(self, W, h, q, tol=1e-6):
+        # had to increase tol to avoid numerical stability issues
+        y, status, n_iters = linprog_batch_std(q, W, h, tol=tol, cholesky=True)
+        assert (status == 0).all()
+        return y
 
 def _generate_hidden_dims(in_dim: int, out_dim: int, max_hidden_dim: int):
     min_hidden_dim = min(in_dim, out_dim)
@@ -91,20 +128,30 @@ class SolverVAE(nn.Module):
     def sample(self, x: torch.Tensor):
         # first, get the conditioned latent distribution p(z|x)
         W, h, q = self.prior_net(x)
+
         # take some samples
         # these must be greater or equal to 0 for the problem definition to be valid!
-        W_sample = W.rsample(tau=1)
+
+        # W must also have at least one one in each column, otherwise the problem is degenerate (how can I set y_i if it doesn't appear in any constraint?)
+        # Right now the hack is as such: set the last part of W to the identity matrix
+        learnable_W = W.rsample(tau=1)
+        I = torch.eye(learnable_W.size(1))
+        Is = I.unsqueeze(0).expand(learnable_W.size(0), -1, -1)
+        W_sample = torch.cat((learnable_W, Is), dim=2)
+
         h_sample = h.rsample()
         q_sample = q.rsample().clamp(1e-3) # must be greater than 0 or problem is unbounded
+
         # and try to reconstruct the observation p(y|x,z)
         y_sample = self.generation_net(W_sample, h_sample, q_sample)
-        return (W, h, q), y_sample
+        Q_sample = torch.bmm(q_sample.unsqueeze(1), y_sample.unsqueeze(2)).squeeze()
+        return (W, h, q), (x, y_sample, W_sample, h_sample, q_sample, Q_sample)
 
     def forward(self, y: torch.Tensor, x: torch.Tensor):
         # get prior from condition p(z|x), and try to reconstruct observation
-        priors, y_hat = self.sample(x)
+        priors, samples = self.sample(x)
         # now, we need to get the posterior q(z|x,y)
         obs = torch.cat([y, x], dim=1)
         posteriors = self.recognition_net(obs)
 
-        return priors, posteriors, y_hat
+        return priors, posteriors, samples

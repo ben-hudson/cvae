@@ -66,7 +66,7 @@ class SolveSymPos(torch.autograd.Function):
             A_LU, A_pivots = torch.linalg.lu(A)
         elif A_pivots is None:
             raise ValueError("A_pivots must be specified with A_LU")
-        x = b.lu_solve(A_LU, A_pivots)
+        x = torch.linalg.lu_solve(A_LU, A_pivots, b)
         ctx.save_for_backward(x, A_LU, A_pivots)
         return x
 
@@ -74,7 +74,7 @@ class SolveSymPos(torch.autograd.Function):
     def backward(ctx, grad_x):
         x, A_LU, A_pivots = ctx.saved_tensors
         need_b, need_A, *_ = ctx.needs_input_grad
-        grad_b = grad_x.lu_solve(A_LU, A_pivots)  # Take advantage of A.t() == A to re-use A_LU and A_pivots
+        grad_b = torch.linalg.lu_solve(A_LU, A_pivots, grad_x)
         grad_A = grad_b.bmm(-T(x)) if need_A else None
         return grad_b, grad_A, None, None
 
@@ -251,10 +251,10 @@ def _get_delta(A, b, c,
 
     # Factorize M since predictor-corrector solves three systems with it
     if cholesky:
-        M = torch.cholesky(M)
+        M = torch.linalg.cholesky(M)
         M_LU = M_pivots = M  # Assign M rather than None as dummy Tensor value for sake of JIT
     else:
-        M_LU, M_pivots = _lu(M.detach())  # Detach because used for custom gradient on M
+        M_LU, M_pivots = torch.linalg.lu_factor(M.detach())  # Detach because used for custom gradient on M
 
     # >>> "predictor-corrector" [4] Section 4.1 <<<
     # >>> Initial check of predictor-corrector, with gamma=0 hard-coded <<<
