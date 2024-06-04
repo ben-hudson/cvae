@@ -44,7 +44,7 @@ class Encoder(nn.Module):
         self.W_logits = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, constr_dim*constr_cols),
             nn.SiLU(),
             nn.Unflatten(-1, (constr_dim, constr_cols))
         )
@@ -57,7 +57,7 @@ class Encoder(nn.Module):
         self.q_shape = nn.Sequential(nn.Linear(hidden_dim, decision_dim), nn.Softplus())
         self.q_rate = nn.Sequential(nn.Linear(hidden_dim, decision_dim), nn.Softplus())
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, eps: float=1e-6):
         hidden = self.mlp(x)
 
         W_logits = self.W_logits(hidden)
@@ -65,11 +65,11 @@ class Encoder(nn.Module):
 
         h_hidden = self.h(hidden)
         h_shape, h_rate = self.h_shape(h_hidden), self.h_rate(h_hidden)
-        h = Gamma(h_shape, h_rate)
+        h = Gamma(h_shape + eps, h_rate + eps)
 
         q_hidden = self.q(hidden)
         q_shape, q_rate = self.q_shape(q_hidden), self.q_rate(q_hidden)
-        q = Gamma(q_shape, q_rate)
+        q = Gamma(q_shape + eps, q_rate + eps)
 
         return W, h, q
 

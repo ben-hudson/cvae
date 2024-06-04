@@ -5,7 +5,7 @@ from torchvision.ops import MLP
 from .solver_vae import Encoder # TODO: move this to common file
 from collections import namedtuple
 
-CVAEDist = namedtuple("CVAEDist", "W h q")
+CVAEDistribtion = namedtuple("CVAEDist", "W h q")
 CVAESample = namedtuple("CVAESample", "y W h q")
 
 class CVAE(nn.Module):
@@ -19,7 +19,7 @@ class CVAE(nn.Module):
 
     def sample(self, x: torch.Tensor):
         # first, get the conditioned latent distribution p(z|x)
-        prior = CVAEDist(*self.prior_net(x))
+        prior = CVAEDistribtion(*self.prior_net(x))
 
         # W must also have at least a single one in each column, otherwise the problem is degenerate (i.e. the
         # constraint is meaningless if it is not related to any variables). Right now, we resolve this by setting the
@@ -30,8 +30,8 @@ class CVAE(nn.Module):
         Is = I.unsqueeze(0).expand(learnable_W.size(0), -1, -1)
         W = torch.cat((learnable_W, Is), dim=2)
 
-        h = prior.h.rsample() # must be greater than 0 or the problem is unfeasible
-        q = prior.q.rsample() # must be greater than 0 or the problem is unbounded
+        h = prior.h.rsample().clamp(1e-3) # must be greater than 0 or the problem is unfeasible
+        q = prior.q.rsample().clamp(1e-3) # must be greater than 0 or the problem is unbounded
 
         # and try to reconstruct the observation p(y|x,z)
         z = torch.cat([W.flatten(1), h, q], dim=1)
@@ -45,6 +45,6 @@ class CVAE(nn.Module):
         prior, sample = self.sample(x)
         # now, we need to get the posterior q(z|x,y)
         obs = torch.cat([y, x], dim=1)
-        posterior = CVAEDist(*self.recognition_net(obs))
+        posterior = CVAEDistribtion(*self.recognition_net(obs))
 
         return prior, posterior, sample

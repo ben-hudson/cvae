@@ -18,7 +18,7 @@
             "request": "launch",
             "program": "scripts/train.py",
             "console": "integratedTerminal",
-            "args": "--model cvae --latent_dim_to_gt --kld_weight 0.01 --workers 1 --batch_size 10 --samples 100"
+            "args": "--model cvae --latent_dim_to_gt --kld_weight 0.01 --workers 1 --batch_size 10 --samples 100 --n_nodes 4 --n_producers 2 --n_consumers 2"
         }
     ]
 }
