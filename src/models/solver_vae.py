@@ -24,20 +24,21 @@ class Encoder(nn.Module):
         hidden_dims = _generate_hidden_dims(input_dim, max_out_dim, max_hidden_dim)
         for hidden_dim in hidden_dims:
             layers.append(torch.nn.Linear(input_dim, hidden_dim))
-            layers.append(nn.BatchNorm1d(hidden_dim))
+            # layers.append(nn.BatchNorm1d(hidden_dim))
             layers.append(nn.SiLU())
             input_dim = hidden_dim
         self.mlp = nn.Sequential(*layers)
 
         # W is a binary matrix
         # we model W_ij with a bernoulli distribution
+        # TODO: clean up these dims: hidden_dim[-1] = input_dim? W_dim = hidden_dim[-1] for consistency?
         W_dim = constr_cols*constr_dim
         self.W_logits = nn.Sequential(
             nn.Linear(hidden_dims[-1], W_dim),
-            nn.BatchNorm1d(W_dim),
+            # nn.BatchNorm1d(W_dim),
             nn.SiLU(),
             nn.Linear(W_dim, W_dim),
-            nn.BatchNorm1d(W_dim),
+            # nn.BatchNorm1d(W_dim),
             nn.SiLU(),
             nn.Unflatten(-1, (constr_dim, constr_cols))
         )
@@ -45,20 +46,20 @@ class Encoder(nn.Module):
         h_dim = hidden_dims[-1]
         self.h = nn.Sequential(
             nn.Linear(hidden_dims[-1], h_dim),
-            nn.BatchNorm1d(h_dim),
+            # nn.BatchNorm1d(h_dim),
             nn.SiLU(),
         )
-        self.h_shape = nn.Softplus(nn.Linear(h_dim, constr_dim))
-        self.h_rate = nn.Softplus(nn.Linear(h_dim, constr_dim))
+        self.h_shape = nn.Sequential(nn.Linear(h_dim, constr_dim), nn.Softplus())
+        self.h_rate = nn.Sequential(nn.Linear(h_dim, constr_dim), nn.Softplus())
 
         q_dim = hidden_dims[-1]
         self.q = nn.Sequential(
             nn.Linear(hidden_dims[-1], q_dim),
-            nn.BatchNorm1d(q_dim),
+            # nn.BatchNorm1d(q_dim),
             nn.SiLU(),
         )
-        self.q_shape = nn.Softplus(nn.Linear(q_dim, y_dim))
-        self.q_rate = nn.Softplus(nn.Linear(q_dim, y_dim))
+        self.q_shape = nn.Sequential(nn.Linear(q_dim, y_dim), nn.Softplus())
+        self.q_rate = nn.Sequential(nn.Linear(q_dim, y_dim), nn.Softplus())
 
     def forward(self, x: torch.Tensor):
         hidden = self.mlp(x)
@@ -99,7 +100,7 @@ class LinSolver(nn.Module):
     def __init__(self, cost_dim, constr_dim):
         super().__init__()
 
-    def forward(self, W, h, q, tol=1e-6):
+    def forward(self, W, h, q, tol=1e-3):
         # had to increase tol to avoid numerical stability issues
         y, status, n_iters = linprog_batch_std(q, W, h, tol=tol, cholesky=True)
         assert (status == 0).all()
@@ -118,12 +119,17 @@ def _generate_hidden_dims(in_dim: int, out_dim: int, max_hidden_dim: int):
 
 
 class SolverVAE(nn.Module):
-    def __init__(self, y_dim: int, x_dim: int, constr_dim: int, max_hidden_dim: int) -> None:
+    def __init__(self, y_dim: int, x_dim: int, constr_dim: int, max_hidden_dim: int, solver: str) -> None:
         super(SolverVAE, self).__init__()
 
         self.prior_net = Encoder(x_dim, y_dim, constr_dim, max_hidden_dim)
         self.recognition_net = Encoder(y_dim + x_dim, y_dim, constr_dim, max_hidden_dim)
-        self.generation_net = CvxSolver(y_dim, constr_dim)
+        if solver == 'cvx':
+            self.generation_net = CvxSolver(y_dim, constr_dim)
+        elif solver == 'lin':
+            self.generation_net = LinSolver(y_dim, constr_dim)
+        else:
+            raise ValueError(f'unknown solver {solver}.')
 
     def sample(self, x: torch.Tensor):
         # first, get the conditioned latent distribution p(z|x)
@@ -135,7 +141,7 @@ class SolverVAE(nn.Module):
         # W must also have at least one one in each column, otherwise the problem is degenerate (how can I set y_i if it doesn't appear in any constraint?)
         # Right now the hack is as such: set the last part of W to the identity matrix
         learnable_W = W.rsample(tau=1)
-        I = torch.eye(learnable_W.size(1))
+        I = torch.eye(learnable_W.size(1), device=learnable_W.device)
         Is = I.unsqueeze(0).expand(learnable_W.size(0), -1, -1)
         W_sample = torch.cat((learnable_W, Is), dim=2)
 

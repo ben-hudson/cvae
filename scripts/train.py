@@ -50,6 +50,7 @@ def get_trainer(model: torch.nn.Module, input_scaler, output_scaler, args: named
         # y = torch.Tensor(y_scaled).float().to(device)
         x = x.float().to(device)
         y = y.float().to(device)
+        Q = Q.float().to(device)
 
         priors, posteriors, sample = model(y, x)
         _, y_sample, W_sample, h_sample, q_sample, Q_sample = sample
@@ -130,14 +131,31 @@ def setup_wandb_logger(args: namedtuple, trainer: Engine, evaluator: Engine, opt
 
     return wandb_logger
 
-def log_latents_to_wandb(wandb, state: EvalState):
+def log_latents_to_wandb(wandb, state: EvalState, args: namedtuple):
     images = dict()
-    output = state.output._asdict()
-    for key, values in output.items():
-        value = values[0] # take first in batch
-        if value.dim() == 1:
-            value = value.reshape(-1, 1)
-        images[key] = wandb.Image(value)
+
+    y = state.output.y.mean(dim=0).reshape(args.n_producers, -1)
+    y_hat = state.output.y_hat.mean(dim=0).reshape(args.n_producers, -1)
+    images['y'] = wandb.Image(torch.cat([y, y_hat], dim=1))
+
+    W = state.output.W.mean(dim=0)
+    W_hat = state.output.W_hat.mean(dim=0)
+    images['W'] = wandb.Image(torch.cat([W, W_hat], dim=1))
+
+    q = state.output.q.mean(dim=0).unsqueeze(0)
+    q_hat = state.output.q_hat.mean(dim=0).unsqueeze(0)
+    images['q'] = wandb.Image(torch.cat([q, q_hat], dim=0))
+
+    h = state.output.h.mean(dim=0).unsqueeze(0)
+    h_hat = state.output.h_hat.mean(dim=0).unsqueeze(0)
+    images['h'] = wandb.Image(torch.cat([h, h_hat], dim=0))
+
+    # output = state.output._asdict()
+    # for key, values in output.items():
+    #     value = values[0] # take first in batch
+    #     if value.dim() == 1:
+    #         value = value.reshape(-1, 1)
+    #     images[key] = wandb.Image(value)
     wandb.log(images)
 
 def get_argparser():
@@ -169,6 +187,7 @@ def get_argparser():
     model_args.add_argument('--latent_dim', type=int, default=10, help='Model latent dimension')
     model_args.add_argument('--latent_dim_to_gt', action='store_true', help='Set model latent dimension to ground truth')
     model_args.add_argument('--hidden_dim', type=int, default=128, help='Hidden dimension in model MLPs')
+    model_args.add_argument('--solver', type=str, choices=['cvx', 'lin'], default='cvx', help='Solver to use for forward problem')
 
     model_args = parser.add_argument_group('logging', description='Logging arguments')
     model_args.add_argument('--wandb_project', type=str, default=None, help='WandB project name')
@@ -200,7 +219,8 @@ if __name__ == '__main__':
             y.shape[0],
             x.shape[0],
             h.shape[0] if args.latent_dim_to_gt else args.latent_dim,
-            args.hidden_dim
+            args.hidden_dim,
+            args.solver
         )
     else:
         raise ValueError(f'unknown model {args.model}')
@@ -215,6 +235,7 @@ if __name__ == '__main__':
     progress = ProgressBar(persist=True)
     progress.attach(trainer, event_name=Events.EPOCH_COMPLETED, closing_event_name=Events.COMPLETED, metric_names='all')
 
+    # args.use_wandb = True
     if args.use_wandb:
         wandb_logger = setup_wandb_logger(args, trainer, evaluator, optimizer)
 
@@ -222,6 +243,6 @@ if __name__ == '__main__':
     def log_validation_metrics(trainer: Engine):
         evaluator.run(val_loader)
         if args.use_wandb:
-            log_latents_to_wandb(wandb_logger._wandb, evaluator.state)
+            log_latents_to_wandb(wandb_logger._wandb, evaluator.state, args)
 
     trainer.run(train_loader, max_epochs=args.max_epochs)

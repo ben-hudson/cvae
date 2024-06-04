@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=8G
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=4G
 #SBATCH --time=06:15:00
 #SBATCH --output /network/scratch/b/ben.hudson/slurm/%j.out
 #SBATCH --error /network/scratch/b/ben.hudson/slurm/%j.err
