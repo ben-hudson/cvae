@@ -11,100 +11,6 @@ from typing import List
 
 from ilop.linprog_solver import linprog_batch_std
 
-class Encoder(nn.Module):
-    def __init__(self, input_dim: int, y_dim: int, constr_dim: int, max_hidden_dim: int):
-        super().__init__()
-
-        constr_cols = y_dim - constr_dim
-        assert constr_cols > 0, 'W ends with an nxn identity matrix, so m > n to have anything to learn.'
-        # constr_cols = y_dim
-
-        layers = []
-        max_out_dim = max(y_dim, constr_cols*constr_dim)
-        hidden_dims = _generate_hidden_dims(input_dim, max_out_dim, max_hidden_dim)
-        for hidden_dim in hidden_dims:
-            layers.append(torch.nn.Linear(input_dim, hidden_dim))
-            # layers.append(nn.BatchNorm1d(hidden_dim))
-            layers.append(nn.SiLU())
-            input_dim = hidden_dim
-        self.mlp = nn.Sequential(*layers)
-
-        # W is a binary matrix
-        # we model W_ij with a bernoulli distribution
-        # TODO: clean up these dims: hidden_dim[-1] = input_dim? W_dim = hidden_dim[-1] for consistency?
-        W_dim = constr_cols*constr_dim
-        self.W_logits = nn.Sequential(
-            nn.Linear(hidden_dims[-1], W_dim),
-            # nn.BatchNorm1d(W_dim),
-            nn.SiLU(),
-            nn.Linear(W_dim, W_dim),
-            # nn.BatchNorm1d(W_dim),
-            nn.SiLU(),
-            nn.Unflatten(-1, (constr_dim, constr_cols))
-        )
-
-        h_dim = hidden_dims[-1]
-        self.h = nn.Sequential(
-            nn.Linear(hidden_dims[-1], h_dim),
-            # nn.BatchNorm1d(h_dim),
-            nn.SiLU(),
-        )
-        self.h_shape = nn.Sequential(nn.Linear(h_dim, constr_dim), nn.Softplus())
-        self.h_rate = nn.Sequential(nn.Linear(h_dim, constr_dim), nn.Softplus())
-
-        q_dim = hidden_dims[-1]
-        self.q = nn.Sequential(
-            nn.Linear(hidden_dims[-1], q_dim),
-            # nn.BatchNorm1d(q_dim),
-            nn.SiLU(),
-        )
-        self.q_shape = nn.Sequential(nn.Linear(q_dim, y_dim), nn.Softplus())
-        self.q_rate = nn.Sequential(nn.Linear(q_dim, y_dim), nn.Softplus())
-
-    def forward(self, x: torch.Tensor):
-        hidden = self.mlp(x)
-
-        W_logits = self.W_logits(hidden)
-        W = ReparametrizedBernoulli(logits=W_logits)
-        # W = F.gumbel_softmax(self.W_logits(hidden), tau=1, hard=True)
-        # h = Normal(F.softplus(self.h_shape(hidden)), torch.exp(self.h_rate(hidden) + eps))
-        # q = Normal(F.softplus(self.q_shape(hidden)), torch.exp(self.q_rate(hidden) + eps))
-        h_hidden = self.h(hidden)
-        h_shape, h_rate = self.h_shape(h_hidden), self.h_rate(h_hidden)
-        h = Gamma(h_shape, h_rate)
-
-        q_hidden = self.q(hidden)
-        q_shape, q_rate = self.q_shape(q_hidden), self.q_rate(q_hidden)
-        q = Gamma(q_shape, q_rate)
-
-        return W, h, q
-
-class CvxSolver(nn.Module):
-    def __init__(self, cost_dim, constr_dim):
-        super().__init__()
-        # TODO: are all of these nonneg?
-        x = cp.Variable(cost_dim)
-        c = cp.Parameter(cost_dim)
-        A = cp.Parameter((constr_dim, cost_dim))
-        b = cp.Parameter(constr_dim)
-        problem = cp.Problem(cp.Minimize(c @ x), [A @ x == b, x >= 0])
-        assert problem.is_dpp(), f'Problem is not DPP'
-
-        self.solver = CvxpyLayer(problem, parameters=[A, b, c], variables=[x])
-
-    def forward(self, A, b, c):
-        solution, = self.solver(A, b, c)
-        return solution
-
-class LinSolver(nn.Module):
-    def __init__(self, cost_dim, constr_dim):
-        super().__init__()
-
-    def forward(self, W, h, q, tol=1e-3):
-        # had to increase tol to avoid numerical stability issues
-        y, status, n_iters = linprog_batch_std(q, W, h, tol=tol, cholesky=True)
-        assert (status == 0).all()
-        return y
 
 def _generate_hidden_dims(in_dim: int, out_dim: int, max_hidden_dim: int):
     min_hidden_dim = min(in_dim, out_dim)
@@ -116,6 +22,89 @@ def _generate_hidden_dims(in_dim: int, out_dim: int, max_hidden_dim: int):
         hidden_dims = list(reversed(hidden_dims))
 
     return hidden_dims
+
+
+class Encoder(nn.Module):
+    def __init__(self, input_dim: int, decision_dim: int, constr_dim: int, max_hidden_dim: int):
+        super().__init__()
+
+        constr_cols = decision_dim - constr_dim
+        assert constr_cols > 0, 'W ends with an nxn identity matrix, so m > n to have anything to learn.'
+
+        # generate a little MLP
+        max_out_dim = max(decision_dim, constr_cols*constr_dim)
+        hidden_dims = _generate_hidden_dims(input_dim, max_out_dim, max_hidden_dim)
+
+        layers = []
+        for hidden_dim in hidden_dims:
+            layers.append(torch.nn.Linear(input_dim, hidden_dim))
+            layers.append(nn.SiLU())
+            input_dim = hidden_dim
+        self.mlp = nn.Sequential(*layers)
+
+        hidden_dim = input_dim # what would have been the next input dim from the MLP above
+
+        # W is a binary matrix
+        # we model W_ij as a bernoulli distribution and sample using gumbel-softmax trick
+        self.W_logits = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Unflatten(-1, (constr_dim, constr_cols))
+        )
+
+        self.h = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU())
+        self.h_shape = nn.Sequential(nn.Linear(hidden_dim, constr_dim), nn.Softplus())
+        self.h_rate = nn.Sequential(nn.Linear(hidden_dim, constr_dim), nn.Softplus())
+
+        self.q = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU())
+        self.q_shape = nn.Sequential(nn.Linear(hidden_dim, decision_dim), nn.Softplus())
+        self.q_rate = nn.Sequential(nn.Linear(hidden_dim, decision_dim), nn.Softplus())
+
+    def forward(self, x: torch.Tensor):
+        hidden = self.mlp(x)
+
+        W_logits = self.W_logits(hidden)
+        W = ReparametrizedBernoulli(logits=W_logits)
+
+        h_hidden = self.h(hidden)
+        h_shape, h_rate = self.h_shape(h_hidden), self.h_rate(h_hidden)
+        h = Gamma(h_shape, h_rate)
+
+        q_hidden = self.q(hidden)
+        q_shape, q_rate = self.q_shape(q_hidden), self.q_rate(q_hidden)
+        q = Gamma(q_shape, q_rate)
+
+        return W, h, q
+
+
+class CvxSolver(nn.Module):
+    def __init__(self, decision_dim, constr_dim):
+        super().__init__()
+        x = cp.Variable(decision_dim)
+        c = cp.Parameter(decision_dim)
+        A = cp.Parameter((constr_dim, decision_dim))
+        b = cp.Parameter(constr_dim)
+        problem = cp.Problem(cp.Minimize(c @ x), [A @ x == b, x >= 0])
+        assert problem.is_dpp(), f'Problem is not DPP'
+
+        self.solver = CvxpyLayer(problem, parameters=[A, b, c], variables=[x])
+
+    def forward(self, A, b, c):
+        solution, = self.solver(A, b, c)
+        return solution
+
+
+class LinSolver(nn.Module):
+    def __init__(self, decision_dim, constr_dim):
+        super().__init__()
+
+    def forward(self, W, h, q, tol=1e-3):
+        # had to increase tol to avoid numerical stability issues
+        y, status, n_iters = linprog_batch_std(q, W, h, tol=tol, cholesky=True)
+        assert (status == 0).all()
+        return y
 
 
 class SolverVAE(nn.Module):
@@ -135,18 +124,17 @@ class SolverVAE(nn.Module):
         # first, get the conditioned latent distribution p(z|x)
         W, h, q = self.prior_net(x)
 
-        # take some samples
-        # these must be greater or equal to 0 for the problem definition to be valid!
-
-        # W must also have at least one one in each column, otherwise the problem is degenerate (how can I set y_i if it doesn't appear in any constraint?)
-        # Right now the hack is as such: set the last part of W to the identity matrix
+        # W must also have at least a single one in each column, otherwise the problem is degenerate (i.e. the
+        # constraint is meaningless if it is not related to any variables). Right now, we resolve this by setting the
+        # last part of W (the part that usually corresponds to the slack variables) to the identity matrix.
+        # TODO: see if we can remove this
         learnable_W = W.rsample(tau=1)
         I = torch.eye(learnable_W.size(1), device=learnable_W.device)
         Is = I.unsqueeze(0).expand(learnable_W.size(0), -1, -1)
         W_sample = torch.cat((learnable_W, Is), dim=2)
 
-        h_sample = h.rsample()
-        q_sample = q.rsample().clamp(1e-3) # must be greater than 0 or problem is unbounded
+        h_sample = h.rsample().clamp(1e-3) # must be greater than 0 or the problem is unfeasible
+        q_sample = q.rsample().clamp(1e-3) # must be greater than 0 or the problem is unbounded
 
         # and try to reconstruct the observation p(y|x,z)
         y_sample = self.generation_net(W_sample, h_sample, q_sample)
