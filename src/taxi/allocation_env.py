@@ -18,6 +18,22 @@ class AllocationDataset(torch.utils.data.Dataset):
         self.env = AllocationEnv(n_nodes, n_producers, n_consumers)
         self.x = torch.distributions.Uniform(1, 10).sample((n_samples, n_producers))
 
+    @property
+    def n_producers(self):
+        return self.env.n_producers
+
+    @property
+    def n_consumers(self):
+        return self.env.n_consumers
+
+    @property
+    def n_constrs(self):
+        return self.env.n_constrs
+
+    @property
+    def n_decisions(self):
+        return self.env.n_decisions
+
     def __len__(self):
         return self.length
 
@@ -57,7 +73,8 @@ class AllocationEnv(gym.Env):
         self.n_constrs = self.n_producers + self.n_consumers
 
         # there are allocations from every producer to every consumer
-        self.n_decisions = self.n_producers * self.n_consumers
+        # as well as slack variables for every producer and consumer
+        self.n_decisions = self.n_producers * self.n_consumers + self.n_producers + self.n_consumers
 
         self.action_space = spaces.Dict({
             'x': spaces.Box(0, np.inf, shape=(self.n_producers, ), dtype=float)

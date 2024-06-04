@@ -1,12 +1,10 @@
 import cvxpy as cp
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from cvxpylayers.torch import CvxpyLayer
 from distributions import ReparametrizedBernoulli
-from torch.distributions import Normal, Gamma
-from torchvision.ops import MLP
+from torch.distributions import Gamma
 from typing import List
 
 from ilop.linprog_solver import linprog_batch_std
@@ -25,16 +23,13 @@ def _generate_hidden_dims(in_dim: int, out_dim: int, max_hidden_dim: int):
 
 
 class Encoder(nn.Module):
-    def __init__(self, input_dim: int, decision_dim: int, constr_dim: int, max_hidden_dim: int):
+    def __init__(self, input_dim: int, decision_dim: int, constr_dim: int, hidden_dims: List[int]):
         super().__init__()
 
         constr_cols = decision_dim - constr_dim
         assert constr_cols > 0, 'W ends with an nxn identity matrix, so m > n to have anything to learn.'
 
-        # generate a little MLP
-        max_out_dim = max(decision_dim, constr_cols*constr_dim)
-        hidden_dims = _generate_hidden_dims(input_dim, max_out_dim, max_hidden_dim)
-
+        # a little MLP
         layers = []
         for hidden_dim in hidden_dims:
             layers.append(torch.nn.Linear(input_dim, hidden_dim))

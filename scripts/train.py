@@ -15,8 +15,10 @@ from torch.distributions import kl_divergence
 from typing import Tuple, List, Union
 from itertools import pairwise
 from sklearn.preprocessing import StandardScaler
+import cooper
+import optimization
 
-TrainState = namedtuple('TrainState', ['kld', 'mse', 'loss'])
+TrainState = namedtuple('TrainState', ['kld', 'aoe', 'loss', 'constr_violation'])
 EvalState = namedtuple('EvalState', ['y', 'y_hat', 'q', 'q_hat', 'W', 'W_hat', 'h', 'h_hat'])
 
 def get_datasets(args: namedtuple) -> Tuple[Subset, Subset, Subset]:
@@ -31,45 +33,43 @@ def get_datasets(args: namedtuple) -> Tuple[Subset, Subset, Subset]:
     subsets = tuple(Subset(dataset, indices[start:end]) for start, end in pairwise(split_indices))
     return subsets
 
-def get_trainer(model: torch.nn.Module, args: namedtuple, device: Union[torch.device, str]='cpu') -> Tuple[Engine, torch.optim.Optimizer]:
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
+def get_trainer(model: torch.nn.Module, args: namedtuple, device: Union[torch.device, str]='cpu') -> Engine:
+    # problem specific stuff happens in here
+    cmp = optimization.InverseLinearOptimization(args.kld_weight, device)
 
-    assert args.kld_weight >= 0 and args.kld_weight <= 1, f'kld weight must be between 0 and 1, it is {args.kld_weight}'
+    # this is all vanilla code from cooper documentation
+    formulation = cooper.LagrangianFormulation(cmp)
+    optimizer = cooper.ConstrainedOptimizer(
+        formulation=formulation,
+        primal_optimizer=torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum),
+        dual_optimizer=cooper.optim.partial_optimizer(torch.optim.SGD, lr=args.lr, momentum=args.momentum),
+    )
+
     def train_step(engine, batch):
         model.train()
         optimizer.zero_grad()
 
-        x, y, W, h, q, Q = batch
+        # The closure is required to compute the Lagrangian
+        # The closure might in turn require the model, inputs, targets, etc.
+        lagrangian = formulation.composite_objective(cmp.closure, model, batch)
 
-        x = x.float().to(device)
-        y = y.float().to(device)
-        Q = Q.float().to(device)
+        # Populate the primal and dual gradients
+        formulation.custom_backward(lagrangian)
 
-        priors, posteriors, sample = model(y, x)
-        Q_sample = sample[5]
-
-        # "absolute objective error" loss from https://arxiv.org/abs/2006.08923
-        mse = F.l1_loss(Q_sample, Q).sum()
-
-        # want posterior to be close to the prior
-        kld = torch.zeros(1, device=device)
-        for p, q in zip(priors, posteriors):
-            kld += kl_divergence(p, q).sum()
-
-        loss = args.kld_weight*kld + (1 - args.kld_weight)*mse
-        loss.backward()
+        # Perform primal and dual parameter updates
         optimizer.step()
 
-        return TrainState(kld.cpu().item(), mse.cpu().item(), loss.cpu().item())
+        return TrainState(cmp.state.misc['kld'].item(), cmp.state.misc['aoe'].item(), cmp.state.loss.item(), cmp.state.eq_defect.item())
 
     trainer = Engine(train_step)
     RunningAverage(output_transform=lambda state: state.kld).attach(trainer, 'KLD')
-    RunningAverage(output_transform=lambda state: state.mse).attach(trainer, 'MSE')
+    RunningAverage(output_transform=lambda state: state.aoe).attach(trainer, 'AOE')
     RunningAverage(output_transform=lambda state: state.loss).attach(trainer, 'Loss')
+    RunningAverage(output_transform=lambda state: state.constr_violation).attach(trainer, 'Constraint Violation')
     trainer.add_event_handler(Events.ITERATION_COMPLETED, TerminateOnNan())
     trainer.add_event_handler(Events.ITERATION_COMPLETED, TimeLimit(limit_sec=args.max_hours*3600))
 
-    return trainer, optimizer
+    return trainer
 
 def get_evaluator(model: torch.nn.Module, args: namedtuple, device='cpu'):
     def eval_step(evaluator, batch):
@@ -80,14 +80,14 @@ def get_evaluator(model: torch.nn.Module, args: namedtuple, device='cpu'):
             y = y.float().to(device)
             x = x.float().to(device)
 
-            _, _, (_, y_hat, W_hat, h_hat, q_hat, _) = model(y, x)
+            prior, posterior, sample = model(y, x)
 
-            return EvalState(y.cpu(), y_hat.cpu(), q, q_hat.cpu(), W, W_hat.cpu(), h, h_hat.cpu())
+            return EvalState(y.cpu(), sample.y.cpu(), q, sample.q.cpu(), W, sample.W.cpu(), h, sample.h.cpu())
 
     evaluator = Engine(eval_step)
     return evaluator
 
-def setup_wandb_logger(args: namedtuple, trainer: Engine, evaluator: Engine, optimizer: torch.optim.Optimizer):
+def setup_wandb_logger(args: namedtuple, trainer: Engine, evaluator: Engine):
     from ignite.handlers.wandb_logger import WandBLogger
 
     wandb_logger = WandBLogger(
@@ -206,14 +206,14 @@ if __name__ == '__main__':
     input_scaler = StandardScaler()
     output_scaler = StandardScaler()
 
-    trainer, optimizer = get_trainer(model, args, device=device)
+    trainer = get_trainer(model, args, device=device)
     evaluator = get_evaluator(model, args, device=device)
 
     progress = ProgressBar(persist=True)
     progress.attach(trainer, event_name=Events.EPOCH_COMPLETED, closing_event_name=Events.COMPLETED, metric_names='all')
 
     if args.use_wandb:
-        wandb_logger = setup_wandb_logger(args, trainer, evaluator, optimizer)
+        wandb_logger = setup_wandb_logger(args, trainer, evaluator)
 
     @trainer.on(Events.ITERATION_COMPLETED)
     def log_validation_metrics(trainer: Engine):
