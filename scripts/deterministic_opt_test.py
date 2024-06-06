@@ -15,36 +15,45 @@ from torchvision.ops import MLP
 
 from synthetic_lp.dataset import SyntheticLPDataset
 
+from ignite.metrics import RunningAverage
+
 class ForwardOptimization(CMP):
-    def __init__(self, dataset, device):
+    def __init__(self, dataset, device, target, nonneg_constr_method):
         super().__init__(is_constrained=True)
         self.device = device
-        self.dataset = dataset
+        self.target = target
+        self.nonneg_constr_method = nonneg_constr_method
+
+        # lord, forgive me
+        self.x_mean = torch.Tensor(dataset.x_scaler.mean_).to(self.device)
+        self.x_scale = torch.Tensor(dataset.x_scaler.scale_).to(self.device)
+        self.c_mean = torch.Tensor(dataset.c_scaler.mean_).to(self.device)
+        self.c_scale = torch.Tensor(dataset.c_scaler.scale_).to(self.device)
+        self.A_mean = torch.Tensor(dataset.A_scaler.mean_).to(self.device)
+        self.A_scale = torch.Tensor(dataset.A_scaler.scale_).to(self.device)
+        self.b_mean = torch.Tensor(dataset.b_scaler.mean_).to(self.device)
+        self.b_scale = torch.Tensor(dataset.b_scaler.scale_).to(self.device)
+        self.f_mean = torch.Tensor(dataset.f_scaler.mean_).to(self.device)
+        self.f_scale = torch.Tensor(dataset.f_scaler.scale_).to(self.device)
 
     def closure(self, model, batch):
         u_scaled, c_scaled, A_scaled, b_scaled, x_scaled, f_scaled = batch
+        u_scaled, c_scaled, A_scaled, b_scaled, x_scaled, f_scaled = u_scaled.to(device), c_scaled.to(device), A_scaled.to(device), b_scaled.to(device), x_scaled.to(device), f_scaled.to(device)
 
-        input = torch.cat([c_scaled, A_scaled.flatten(1), b_scaled], dim=1).to(self.device)
-        x_pred_scaled = model(input).cpu()
+        input = torch.cat([c_scaled, A_scaled.flatten(1), b_scaled], dim=1)
+        x_pred_scaled = model(input)
 
-        # lord, forgive me
-        x_mean = torch.Tensor(self.dataset.x_scaler.mean_)
-        x_scale = torch.Tensor(self.dataset.x_scaler.scale_)
-        c_mean = torch.Tensor(self.dataset.c_scaler.mean_)
-        c_scale = torch.Tensor(self.dataset.c_scaler.scale_)
-        A_mean = torch.Tensor(self.dataset.A_scaler.mean_).reshape(A_scaled.size(1), A_scaled.size(2))
-        A_scale = torch.Tensor(self.dataset.A_scaler.scale_).reshape(A_scaled.size(1), A_scaled.size(2))
-        b_mean = torch.Tensor(self.dataset.b_scaler.mean_)
-        b_scale = torch.Tensor(self.dataset.b_scaler.scale_)
-        f_mean = torch.Tensor(self.dataset.f_scaler.mean_)
-        f_scale = torch.Tensor(self.dataset.f_scaler.scale_)
+        x_pred = x_pred_scaled*self.x_scale + self.x_mean
+        x = x_scaled*self.x_scale + self.x_mean
+        c = c_scaled*self.c_scale + self.c_mean
+        A = A_scaled*self.A_scale.reshape(A_scaled.size(1), A_scaled.size(2)) + self.A_mean.reshape(A_scaled.size(1), A_scaled.size(2))
+        b = b_scaled*self.b_scale + self.b_mean
+        f = f_scaled*self.f_scale + self.f_mean
 
-        x_pred = x_pred_scaled*x_scale + x_mean
-        x = x_scaled*x_scale + x_mean
-        c = c_scaled*c_scale + c_mean
-        A = A_scaled*A_scale + A_mean
-        b = b_scaled*b_scale + b_mean
-        f = f_scaled*f_scale + f_mean
+        if self.nonneg_constr_method == 'softplus':
+            x_pred = F.softplus(x_pred)
+        elif self.nonneg_constr_method == 'relu':
+            x_pred = F.relu(x_pred)
 
         x_pred = x_pred.unsqueeze(2)
         x = x.unsqueeze(2)
@@ -53,10 +62,33 @@ class ForwardOptimization(CMP):
 
         f_pred = torch.bmm(c, x_pred).squeeze(2)
 
-        obj_loss = F.l1_loss(f, f_pred)
+        aoe_loss = F.l1_loss(f, f_pred)
+        obj_loss = f_pred.mean()
+
+        # equality constraint Ax = b --> Ax - b = 0
         constr_loss = torch.bmm(A, x_pred) - b
 
-        return CMPState(loss=obj_loss, eq_defect=constr_loss)
+        # non-negativity constraint x >= 0 --> -x <= 0
+        if self.nonneg_constr_method == 'constr':
+            nonneg_loss = -x_pred
+        else:
+            nonneg_loss = None
+
+        if self.target == 'aoe':
+            loss = aoe_loss
+        elif self.target == 'f':
+            loss = obj_loss
+        else:
+            raise Exception(f'unknown target {self.target}')
+
+        metrics = {
+            'aoe': aoe_loss.item(),
+            'obj': obj_loss.item(),
+            'constr_volation': constr_loss.mean().item(),
+            'nonneg_loss': (-x_pred).mean().item()
+        }
+
+        return CMPState(loss=loss, ineq_defect=nonneg_loss, eq_defect=constr_loss, misc=metrics)
 
 
 def get_datasets(args: namedtuple) -> typing.Tuple[Subset, Subset, Subset]:
@@ -84,12 +116,14 @@ def get_argparser():
 
     train_args = parser.add_argument_group('training', description='Training arguments')
     train_args.add_argument('--no_gpu', action='store_true', help='Do not use the GPU even if one is available')
-    train_args.add_argument('--lr', type=float, default=1e-4, help='Optimizer learning rate')
+    train_args.add_argument('--lr', type=float, default=1e-5, help='Optimizer learning rate')
     train_args.add_argument('--momentum', type=float, default=8e-2, help='Optimizer momentum')
     train_args.add_argument('--dual_restarts', action='store_true', help='Use dual restarts')
     train_args.add_argument('--extra_gradient', action='store_true', help='Use extra-gradient optimizers')
     train_args.add_argument('--max_epochs', type=int, default=500, help='Maximum number of training epochs')
     train_args.add_argument('--max_hours', type=int, default=3, help='Maximum hours to train')
+    train_args.add_argument('--target', type=str, choices=['aoe', 'f'], default='aoe', help='Minimization target (aoe = l1 loss between predicted and true objective, f = true objective function)')
+    train_args.add_argument('--nonneg_constr_method', type=str, choices=['none', 'softplus', 'relu', 'constr'], default='none', help='How to ensure predicted decisions satisfy non-negativity constraint')
 
     model_args = parser.add_argument_group('logging', description='Logging arguments')
     model_args.add_argument('--wandb_project', type=str, default=None, help='WandB project name')
@@ -101,6 +135,8 @@ def get_argparser():
 if __name__ == '__main__':
     args = get_argparser().parse_args()
     args.use_wandb = args.wandb_project is not None
+    assert not (args.target == 'f' and args.nonneg_constr_method == 'none'), 'You must specify a method to enforce the non-negativity constraint if the minimization target is f'
+    # assert not (args.nonneg_constr_method != 'constr' and args.dual_restarts), 'Dual restarts will only have an effect if the non-negativity constraint is modelled as a constraint (our other constraints are equalities)'
     if args.use_wandb:
         import wandb
         run = wandb.init(
@@ -116,11 +152,11 @@ if __name__ == '__main__':
     u, c, A, b, x, f = dataset[0]
     in_dim = c.size(0) + A.size(0)*A.size(1) + b.size(0)
     out_dim = x.size(0)
-    model = MLP(in_dim, [128, 128, 64, 64, 32, 32, out_dim])
+    model = MLP(in_dim, [128, 128, 64, 64, 32, 32, out_dim], activation_layer=torch.nn.SiLU)
     model.to(device)
 
     # problem specific stuff happens in here
-    cmp = ForwardOptimization(dataset, device)
+    cmp = ForwardOptimization(dataset, device, args.target, args.nonneg_constr_method)
 
     formulation = cooper.LagrangianFormulation(cmp)
     if args.extra_gradient:
@@ -137,6 +173,13 @@ if __name__ == '__main__':
         dual_restarts=args.dual_restarts
     )
 
+    metrics = {
+        'aoe': RunningAverage(output_transform=lambda x: x),
+        'obj': RunningAverage(output_transform=lambda x: x),
+        'constr_volation': RunningAverage(output_transform=lambda x: x),
+        'nonneg_loss': RunningAverage(output_transform=lambda x: x)
+    }
+
     progress_bar = tqdm.trange(args.max_epochs)
     for epoch in progress_bar:
         for batch in loader:
@@ -151,10 +194,13 @@ if __name__ == '__main__':
             else:
                 optimizer.step()
 
-            metrics = {
-                "obj_loss": cmp.state.loss.item(),
-                "constr_loss": cmp.state.eq_defect.sum().item()
-            }
-            progress_bar.set_postfix(metrics)
-            if args.use_wandb:
-                wandb.log(metrics)
+            for name, avg in metrics.items():
+                avg.update(cmp.state.misc[name])
+
+        metrics_sample = {name: avg.compute() for name, avg in metrics.items()}
+        progress_bar.set_postfix(metrics_sample)
+        if args.use_wandb:
+            wandb.log(metrics_sample)
+
+        for avg in metrics.values():
+            avg.reset()
