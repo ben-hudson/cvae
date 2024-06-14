@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=2
 #SBATCH --mem=4G
 #SBATCH --time=01:00:00
 #SBATCH --output /network/scratch/b/ben.hudson/slurm/%j.out
@@ -16,11 +16,15 @@ module --quiet load cuda/11.8
 
 source .venv/bin/activate
 
-DATAROOT=$SCRATCH/synthetic_lp_dataset
-DATASET=2var8cons_InvPLP0.tar.gz
+if [ $# -lt 1 ]; then
+    echo "Pass an dataset"
+    exit 1
+fi
+DATASET=${1}
+EXTRA_ARGS=${@:2}
 
-EXTRA_ARGS=${@}
+DATAROOT=$SCRATCH/datasets/synthetic_lp/40_instances/10var80cons/
 
 cp $DATAROOT/$DATASET $SLURM_TMPDIR
 
-python scripts/deterministic_opt_test.py $SLURM_TMPDIR/$DATASET --wandb_project deterministic_opt_test $EXTRA_ARGS
+python scripts/deterministic_io.py $SLURM_TMPDIR/$DATASET --wandb_project deterministic_io $EXTRA_ARGS

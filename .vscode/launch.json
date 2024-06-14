@@ -19,6 +19,14 @@
             "program": "scripts/train.py",
             "console": "integratedTerminal",
             "args": "--model cvae --latent_dim_to_gt --kld_weight 0.01 --workers 1 --batch_size 10 --samples 100 --n_nodes 4 --n_producers 2 --n_consumers 2"
+        },
+        {
+            "name": "Python Debugger: deterministic_io.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/deterministic_io.py",
+            "console": "integratedTerminal",
+            "args": "~/scratch/datasets/synthetic_lp/1250_instances/2var8cons/2var8cons_InvPLP0.tgz --batch_size 250 --workers 2"
         }
     ]
 }
