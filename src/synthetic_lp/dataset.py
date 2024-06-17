@@ -20,6 +20,7 @@ class SyntheticLPDataset(torch.utils.data.Dataset):
             x = self._load_tensor_from_tarball(dir / "x.pt", tarball).squeeze()
             f = self._load_tensor_from_tarball(dir / "f.pt", tarball)
 
+            # for an equality constraint, add the slack variables
             if include_slack:
                 slack = self._load_tensor_from_tarball(dir / "slack.pt", tarball).squeeze()
                 # append slack variables to x and adjust c, A appropriately
@@ -66,22 +67,24 @@ class SyntheticLPDataset(torch.utils.data.Dataset):
             self.u, self.c, self.A, self.b, self.x, self.f = u, c, A, b, x, f
 
     def norm(self, u, c, A, b, x, f):
-        u_normed = (u - self.means.u)/self.scales.u
-        c_normed = (c - self.means.c)/self.scales.c
-        A_normed = (A - self.means.A)/self.scales.A
-        b_normed = (b - self.means.b)/self.scales.b
-        x_normed = (x - self.means.x)/self.scales.x
-        f_normed = (f - self.means.f)/self.scales.f
+        assert self.is_normed, "can't call norm on an unnormed dataset"
+        u_normed = (u - self.means.u.to(u.device))/self.scales.u.to(u.device)
+        c_normed = (c - self.means.c.to(c.device))/self.scales.c.to(c.device)
+        A_normed = (A - self.means.A.to(A.device))/self.scales.A.to(A.device)
+        b_normed = (b - self.means.b.to(b.device))/self.scales.b.to(b.device)
+        x_normed = (x - self.means.x.to(x.device))/self.scales.x.to(x.device)
+        f_normed = (f - self.means.f.to(f.device))/self.scales.f.to(f.device)
 
         return u_normed, c_normed, A_normed, b_normed, x_normed, f_normed
 
     def unnorm(self, u_normed, c_normed, A_normed, b_normed, x_normed, f_normed):
-        u = self.means.u + self.scales.u*u_normed
-        c = self.means.c + self.scales.c*c_normed
-        A = self.means.A + self.scales.A*A_normed
-        b = self.means.b + self.scales.b*b_normed
-        x = self.means.x + self.scales.x*x_normed
-        f = self.means.f + self.scales.f*f_normed
+        assert self.is_normed, "can't call unnorm on an unnormed dataset"
+        u = self.means.u.to(u_normed.device) + self.scales.u.to(u_normed.device)*u_normed
+        c = self.means.c.to(c_normed.device) + self.scales.c.to(c_normed.device)*c_normed
+        A = self.means.A.to(A_normed.device) + self.scales.A.to(A_normed.device)*A_normed
+        b = self.means.b.to(b_normed.device) + self.scales.b.to(b_normed.device)*b_normed
+        x = self.means.x.to(x_normed.device) + self.scales.x.to(x_normed.device)*x_normed
+        f = self.means.f.to(f_normed.device) + self.scales.f.to(f_normed.device)*f_normed
 
         return u, c, A, b, x, f
 

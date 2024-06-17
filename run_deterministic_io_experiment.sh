@@ -23,8 +23,8 @@ fi
 DATASET=${1}
 EXTRA_ARGS=${@:2}
 
-DATAROOT=$SCRATCH/datasets/synthetic_lp/40_instances/10var80cons/
+DATAROOT=$SCRATCH/datasets/synthetic_lp
 
-cp $DATAROOT/$DATASET $SLURM_TMPDIR
+# cp $DATAROOT/$DATASET $SLURM_TMPDIR
 
-python scripts/deterministic_io.py $SLURM_TMPDIR/$DATASET --wandb_project deterministic_io $EXTRA_ARGS
+python scripts/deterministic_io.py $DATAROOT/$DATASET --wandb_project deterministic_io $EXTRA_ARGS

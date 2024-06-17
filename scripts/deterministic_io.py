@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 import tqdm
 import typing
+import multiprocessing as mp
 
 from collections import namedtuple
 from cooper import ConstrainedMinimizationProblem as CMP, CMPState
@@ -18,50 +19,87 @@ from sklearn.cross_decomposition import CCA
 from synthetic_lp.dataset import SyntheticLPDataset
 
 from ignite.metrics import RunningAverage
-
+from torchvision.utils import make_grid
 from models.deterministic_lp import DeterministicLP
+from scipy.optimize import linprog
+
+def solve_batch(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None, workers=None):
+    if A_ub is None:
+        A_ub = [None]*len(c)
+    if b_ub is None:
+        b_ub = [None]*len(c)
+    if A_eq is None:
+        A_eq = [None]*len(c)
+    if b_eq is None:
+        b_eq = [None]*len(c)
+
+    with mp.Pool(processes=workers) as workers:
+        results = workers.starmap(linprog, zip(c, A_ub, b_ub, A_eq, b_eq))
+
+    f, x, success = zip(*[(result.fun, result.x, result.success) for result in results])
+    return f, x, success
+
+
+def get_val_metrics(c, A, b, x_pred, f, constr_type):
+    # there are three metrics we care about
+    # 1. is the predicted solution feasible wrt to the true problem?
+    # 2. if not, how infeasible is it?
+    # 3. how optimal is it?
+
+
+    obj = torch.bmm(c, x_pred).squeeze(2)
+    constr = torch.bmm(A, x_pred)
+    if constr_type == 'eq':
+        feas = torch.isclose(constr, b)
+    else:
+        feas = constr < b
+    constr_volation = (b[~feas] - constr[~feas])/b[~feas]
+    constr_volation = constr[~feas]/b[~feas] - 1
+    sub_optimality = obj/f - 1
+
+    return {
+        'other/feas_frac': feas.sum()/feas.numel(), # fraction of satisfied constraints
+        'other/rel_feas_violation': constr_volation.mean(),
+        'other/rel_sub_optimality': sub_optimality.mean(),
+    }
+
+# assemble the problem into the "extended matrix representation" to visualize:
+# [0 c^T 0]
+# [0 I   x]
+# [1 -A  b]
+def render_problem(c, A, b, x, f):
+    first_row = torch.cat([torch.zeros(1, 1, device=c.device), c, torch.zeros(1, 1, device=c.device)], dim=1)
+    secnd_row = torch.cat([torch.zeros_like(x), torch.eye(x.size(0), device=x.device), x], dim=1)
+    third_row = torch.cat([torch.ones_like(b), -A, b], dim=1)
+
+    img = torch.cat([first_row, secnd_row, third_row])
+    return img
 
 class ForwardOptimization(CMP):
-    def __init__(self, dataset, device, target, nonneg_constr_method, constr_type):
+    def __init__(self, unnorm_fun, device, loss, constr, extra_constrs):
         super().__init__(is_constrained=True)
-        self.device = device
-        self.target = target
-        self.nonneg_constr_method = nonneg_constr_method
-        self.constr_type = constr_type
 
-        # lord, forgive me
-        self.x_mean = torch.Tensor(dataset.x_scaler.mean_).to(self.device)
-        self.x_scale = torch.Tensor(dataset.x_scaler.scale_).to(self.device)
-        self.c_mean = torch.Tensor(dataset.c_scaler.mean_).to(self.device)
-        self.c_scale = torch.Tensor(dataset.c_scaler.scale_).to(self.device)
-        self.A_mean = torch.Tensor(dataset.A_scaler.mean_).to(self.device)
-        self.A_scale = torch.Tensor(dataset.A_scaler.scale_).to(self.device)
-        self.b_mean = torch.Tensor(dataset.b_scaler.mean_).to(self.device)
-        self.b_scale = torch.Tensor(dataset.b_scaler.scale_).to(self.device)
-        self.f_mean = torch.Tensor(dataset.f_scaler.mean_).to(self.device)
-        self.f_scale = torch.Tensor(dataset.f_scaler.scale_).to(self.device)
+        self.unnorm = unnorm_fun
+        self.device = device
+
+        self.loss = loss
+        self.constr = constr
+        self.extra_constrs = extra_constrs
 
     def sample(self, model, batch):
-        u_scaled, c_scaled, A_scaled, b_scaled, x_scaled, f_scaled = batch
-        u_scaled, c_scaled, A_scaled, b_scaled, x_scaled, f_scaled = u_scaled.to(device), c_scaled.to(device), A_scaled.to(device), b_scaled.to(device), x_scaled.to(device), f_scaled.to(device)
+        u_normed, c_normed, A_normed, b_normed, x_normed, f_normed = batch
+        _, c, A, b, x, f = self.unnorm(u_normed, c_normed, A_normed, b_normed, x_normed, f_normed)
+        c = c.to(self.device).unsqueeze(1)
+        A = A.to(self.device)
+        b = b.to(self.device).unsqueeze(2)
+        x = x.to(self.device).unsqueeze(2)
+        f = f.to(self.device)
 
-        c_pred_scaled, A_pred_scaled, b_pred_scaled, x_pred_scaled = model(u_scaled)
+        u_normed = u_normed.to(self.device)
+        c_pred_normed, A_pred_normed, b_pred_normed, x_pred_normed = model(u_normed)
 
-        x = x_scaled*self.x_scale + self.x_mean
-        c = c_scaled*self.c_scale + self.c_mean
-        A = A_scaled*self.A_scale.reshape(A_scaled.size(1), A_scaled.size(2)) + self.A_mean.reshape(A_scaled.size(1), A_scaled.size(2))
-        b = b_scaled*self.b_scale + self.b_mean
-        f = f_scaled*self.f_scale + self.f_mean
-
-        x = x.unsqueeze(2)
-        c = c.unsqueeze(1)
-        b = b.unsqueeze(2)
-
-        x_pred = x_pred_scaled*self.x_scale + self.x_mean
-        c_pred = c_pred_scaled*self.c_scale + self.c_mean
-        A_pred = A_pred_scaled*self.A_scale.reshape(A_pred_scaled.size(1), A_pred_scaled.size(2)) + self.A_mean.reshape(A_pred_scaled.size(1), A_pred_scaled.size(2))
-        b_pred = b_pred_scaled*self.b_scale + self.b_mean
-
+        # pass zeros for u and f as placeholders
+        _, c_pred, A_pred, b_pred, x_pred, _ = self.unnorm(torch.zeros_like(u_normed), c_pred_normed, A_pred_normed, b_pred_normed, x_pred_normed, torch.zeros_like(f_normed))
         x_pred = x_pred.unsqueeze(2)
         c_pred = c_pred.unsqueeze(1)
         b_pred = b_pred.unsqueeze(2)
@@ -72,78 +110,98 @@ class ForwardOptimization(CMP):
     def closure(self, model, batch):
         (c, A, b, x, f), (c_pred, A_pred, b_pred, x_pred, f_pred) = self.sample(model, batch)
 
-        f_c_pred_x_gt = torch.bmm(c_pred, x).squeeze(2)
-        f_c_gt_x_pred = torch.bmm(c, x_pred).squeeze(2)
+        # we observe x and f, and we want to use them to get losses on all of the problem parameters
+        # there are a lot of constraints we can impose, the question is which ones?
+        # A_pred * x_pred <= (or =) b_pred
+        # A_pred * x <= (or =) b_pred
+        # f == c_pred*x_pred
+        # f == c_pred*x
+        # for now, we calculate all of them and report them as metrics
+        x_pred_constr = torch.bmm(A_pred, x_pred) - b_pred
+        x_true_constr = torch.bmm(A_pred, x) - b_pred
+        x_pred_obj = f_pred
+        x_true_obj = torch.bmm(c_pred, x).squeeze(2)
+        x_pred_obj_err = x_pred_obj - f
+        x_true_obj_err = x_true_obj - f
 
-        # so we observe x and f, and we want to thse to get losses on all of the constraints
-        # A_pred*x_pred = b_pred
-        # A_pred*x = b_pred
-        # c_pred*x = c_pred*x_pred = f
-        constr_loss = torch.bmm(A_pred, x_pred) - b_pred
-        gt_constr_loss = torch.bmm(A_pred, x) - b_pred
-        if self.constr_type == 'ineq':
-            ineq_constr_list = [constr_loss.squeeze(2), gt_constr_loss.squeeze(2)]
-            eq_constr_list = []
-        elif self.constr_type == 'eq':
-            eq_constr_list = [constr_loss.squeeze(2), gt_constr_loss.squeeze(2)]
-            ineq_constr_list = []
-
-        # if self.target != 'aoe': # if we are minimizing aoe we don't need to add the constraint too
-        #     eq_constr_list.append(f_pred - f)
-        # if self.target != 'aoe_c_only': # likewise for the cost-only aoe
-        #     eq_constr_list.append(f_c_pred_x_gt - f)
-        # if self.target != 'aoe_x_only': # likewise for the cost-only aoe
-        #     eq_constr_list.append(f_c_gt_x_pred - f)
-
-        ineq_constrs = torch.zeros(A.size(0), 1) if len(ineq_constr_list) == 0 else torch.cat(ineq_constr_list, dim=1)
-        eq_constrs = torch.zeros(A.size(0), 1) if len(eq_constr_list) == 0 else torch.cat(eq_constr_list, dim=1)
+        # there are also a lot of losses
+        # some of of the losses described in https://arxiv.org/abs/2109.03920
+        md_loss = F.mse_loss(x_pred, x)
+        aoe_loss = x_pred_obj_err.abs().mean()
+        roe_loss = torch.abs(f_pred/f - 1).mean() # TODO: implement the scaling invariance constraint here
+        f_loss = x_pred_obj.mean() # equivalent to minimizing violation of kkt conditions when we are doing constraint optimization already
 
 
-        # but which minimization objective do we choose?
-        # min c_pred*x_pred
-        # min c_pred*x
-        # min l1(f, c_pred*x)
-        # min l1(f, c_pred*x_pred)
-        if self.target == 'aoe':
-            loss = F.l1_loss(f_pred, f)
-        elif self.target == 'aoe_c_only':
-            loss = F.l1_loss(f_c_pred_x_gt, f)
-        elif self.target == 'aoe_x_only':
-            loss = F.l1_loss(f_c_gt_x_pred, f)
-        elif self.target == 'f':
-            loss = f_pred.mean()
-        elif self.target == 'f_c_only':
-            loss = f_c_pred_x_gt.mean()
-        elif self.target == 'f_x_only':
-            loss = f_c_gt_x_pred.mean()
-        elif self.target == 'de':
-            loss = F.mse_loss(x, x_pred)
+        # pick a loss
+        if self.loss == 'md':
+            loss = md_loss
+
+        elif self.loss == 'aoe' or self.loss == 'x_pred_obj_err':
+            assert 'x_pred_obj' not in self.extra_constrs, "can't minimize |f - f^| and constrain f = f^"
+            loss = x_pred_obj_err.abs().mean()
+
+        elif self.loss == 'x_true_obj_err':
+            assert 'x_true_obj' not in self.extra_constrs, "can't minimize |f - c^ * x| and constrain f = c^ * x"
+            loss = x_true_obj_err.abs().mean()
+
+        elif self.loss == 'roe':
+            loss = roe_loss
+
+        elif self.loss == 'f' or self.loss == 'x_pred_obj':
+            assert 'x_pred_obj' not in self.extra_constrs, "can't minimize f^ and constrain f = f^"
+            loss = x_pred_obj.mean()
+
+        elif self.loss == 'f' or self.loss == 'x_true_obj':
+            assert 'x_true_obj' not in self.extra_constrs, "can't minimize c^ * x and constrain f = c^ * x"
+            loss = x_true_obj.mean()
+
         else:
-            raise Exception('unknown target {self.target}')
+            raise ValueError(f'unknown loss {self.loss}')
 
-        constr_violation = eq_constrs.abs().mean().item()
-        if (ineq_constrs > 0).any():
-            constr_violation += ineq_constrs[ineq_constrs > 0].mean().item()
+        # set up constraints
+        ineq_constrs = []
+        eq_constrs = []
+        if self.constr == 'ineq':
+            if 'x_pred_constr' in self.extra_constrs:
+                ineq_constrs.append(x_pred_constr)
+            if 'x_true_constr' in self.extra_constrs:
+                ineq_constrs.append(x_true_constr)
+        elif self.constr == 'eq':
+            if 'x_pred_constr' in self.extra_constrs:
+                eq_constrs.append(x_pred_constr)
+            if 'x_true_constr' in self.extra_constrs:
+                eq_constrs.append(x_true_constr)
+        else:
+            raise ValueError(f'unknown constraint {self.constr}')
+
+        if 'x_pred_obj' in self.extra_constrs:
+            eq_constrs.append(x_pred_obj)
+        if 'x_true_obj' in self.extra_constrs:
+            eq_constrs.append(x_true_obj)
+
+        ineq_defect = None if len(ineq_constrs) == 0 else torch.cat(ineq_constrs, dim=1)
+        eq_defect = None if len(eq_constrs) == 0 else torch.cat(eq_constrs, dim=1)
+
+        # finally, some aggregated metrics
         metrics = {
-            'aoe': F.l1_loss(f_pred, f).item(),
-            'obj': f_pred.mean().item(),
-            'constr_volation': constr_violation,
+            # the losses
+            'loss/md_loss': md_loss.detach(),
+            'loss/aoe_loss': aoe_loss.detach(),
+            'loss/roe_loss': roe_loss.detach(),
+            'loss/f_loss': f_loss.detach(),
+
+            # the constraint violations
+            # inequality constraint values are positive when violated
+            'constr/x_pred_constr_loss': x_pred_constr.detach().clamp(min=0).mean() if self.constr == 'ineq' else x_pred_constr.detach().abs().mean(),
+            'constr/x_true_constr_loss': x_true_constr.detach().clamp(min=0).mean() if self.constr == 'ineq' else x_true_constr.detach().abs().mean(),
+            'constr/x_pred_obj_loss': x_pred_obj.detach().abs().mean(),
+            'constr/x_true_obj_loss': x_true_obj.detach().abs().mean(),
+
+            # and the validation metrics for the training data
+            **get_val_metrics(c, A, b, x_pred, f, self.constr)
         }
 
-        return CMPState(loss=loss, ineq_defect=ineq_constrs, eq_defect=eq_constrs, misc=metrics)
-
-
-def get_datasets(args: namedtuple) -> typing.Tuple[Subset, Subset, Subset]:
-    dataset = SyntheticLPDataset("datasets/2var8cons_InvPLP0.tar.gz", "test", norm=True)
-
-    samples = len(dataset)
-    indices = np.arange(samples).tolist() # dataloader shuffles, don't need to here
-    split = np.array([0, args.train_frac, args.val_frac, args.test_frac])
-    assert np.isclose(split.sum(), 1), f'train-val-test split does not sum to 1, it sums to {split.sum()}'
-
-    split_indices = np.cumsum(split*samples).astype(int)
-    subsets = tuple(Subset(dataset, indices[start:end]) for start, end in pairwise(split_indices))
-    return subsets
+        return CMPState(loss=loss, ineq_defect=ineq_defect, eq_defect=eq_defect, misc=metrics)
 
 def get_argparser():
     parser = argparse.ArgumentParser('Train an MLP to approximate an LP solver using constrained optimization')
@@ -151,7 +209,7 @@ def get_argparser():
     dataset_args = parser.add_argument_group('dataset', description='Dataset arguments')
     dataset_args.add_argument('dataset_path', type=pathlib.Path, help='Path to dataset')
     dataset_args.add_argument('--batch_size', type=int, default=2048, help='Batch size')
-    dataset_args.add_argument('--slack', action='store_true', help='Slack is included in the dataset (model should use equality constraints, not inequalitiy constraints)')
+    dataset_args.add_argument('--constr', choices=['ineq', 'eq'], default='ineq', help='Data represents a problem with inequality or equality constraints')
     dataset_args.add_argument('--workers', type=int, default=2, help='Number of DataLoader workers')
 
     train_args = parser.add_argument_group('training', description='Training arguments')
@@ -162,8 +220,9 @@ def get_argparser():
     train_args.add_argument('--no_extra_gradient', action='store_true', help='Use extra-gradient optimizers')
     train_args.add_argument('--max_epochs', type=int, default=500, help='Maximum number of training epochs')
     train_args.add_argument('--max_hours', type=int, default=3, help='Maximum hours to train')
-    train_args.add_argument('--target', type=str, choices=['aoe', 'f', 'aoe_c_only', 'f_c_only', 'de'], default='aoe', help='Minimization target (aoe = l1 loss between predicted and true objective, f = true objective function)')
-    train_args.add_argument('--nonneg_constr_method', type=str, choices=['none', 'softplus', 'relu', 'constr'], default='relu', help='How to ensure predicted decisions satisfy non-negativity constraint')
+    train_args.add_argument('--loss', type=str, choices=['md', 'aoe', 'roe', 'f', 'x_pred_obj_err', 'x_true_obj_err', 'x_pred_obj', 'x_true_obj'], default='aoe', help='Minimization target')
+    train_args.add_argument('--extra_constrs', type=str, nargs='*', choices=['x_pred_constr', 'x_true_constr', 'x_pred_obj', 'x_true_obj'], default=[], help='Constraints to add')
+    train_args.add_argument('--solve_exact', action='store_true', help='Solve the problems exactly during validation')
 
     model_args = parser.add_argument_group('logging', description='Logging arguments')
     model_args.add_argument('--wandb_project', type=str, default=None, help='WandB project name')
@@ -172,23 +231,10 @@ def get_argparser():
 
     return parser
 
-# this is a little random, but assemble the matrices into "Extended matrix representation"
-# [0 c^T 0]
-# [0 I   x]
-# [1 -A  b]
-def render_problem(A, b, c, x, f):
-    first_row = torch.cat([torch.zeros(1), c, torch.zeros(1)]).unsqueeze(0)
-    second_row = torch.cat([torch.zeros_like(x), torch.eye(x.size(0)), x], dim=1)
-    third_row = torch.cat([torch.ones_like(b), -A, b], dim=1)
-
-    img = torch.cat([first_row, second_row, third_row])
-    return img
-
 if __name__ == '__main__':
     args = get_argparser().parse_args()
-    args.use_wandb = args.wandb_project is not None
     args.extra_gradient = not args.no_extra_gradient
-    assert not (args.target == 'f' and args.nonneg_constr_method == 'none'), 'You must specify a method to enforce the non-negativity constraint if the minimization target is f'
+    args.use_wandb = args.wandb_project is not None
     if args.use_wandb:
         import wandb
         run = wandb.init(
@@ -196,10 +242,10 @@ if __name__ == '__main__':
             config=args,
         )
 
-    train_set = SyntheticLPDataset(args.dataset_path, "train", args.slack, norm=True)
-    test_set = SyntheticLPDataset(args.dataset_path, "test", args.slack, norm=False)
+    train_set = SyntheticLPDataset(args.dataset_path, "train", args.constr == "eq", norm=True)
+    test_set = SyntheticLPDataset(args.dataset_path, "test", args.constr == "eq", norm=False)
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, drop_last=True)
-    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, drop_last=True)
+    test_loader = DataLoader(test_set, batch_size=min(args.batch_size, len(test_set)), shuffle=False, num_workers=args.workers, drop_last=True)
 
     device = 'cuda:0' if torch.cuda.is_available() and not args.no_gpu else 'cpu'
 
@@ -207,8 +253,8 @@ if __name__ == '__main__':
     model = DeterministicLP(u.size(0), x.size(0), b.size(0))
     model.to(device)
 
-    # problem specific stuff happens in here
-    cmp = ForwardOptimization(train_set, device, args.target, args.nonneg_constr_method, 'eq' if args.slack else 'ineq')
+    # training logic happens here
+    cmp = ForwardOptimization(train_set.unnorm, device, args.loss, args.constr, args.extra_constrs)
 
     formulation = cooper.LagrangianFormulation(cmp)
     if args.extra_gradient:
@@ -225,17 +271,8 @@ if __name__ == '__main__':
         dual_restarts=args.dual_restarts
     )
 
-    train_metrics = {
-        'aoe': RunningAverage(output_transform=lambda x: x),
-        'obj': RunningAverage(output_transform=lambda x: x),
-        'constr_volation': RunningAverage(output_transform=lambda x: x),
-        # 'nonneg_loss': RunningAverage(output_transform=lambda x: x)
-    }
-    val_metrics = {
-        'sub_optimality': RunningAverage(output_transform=lambda x: x),
-        'n_feasible': RunningAverage(output_transform=lambda x: x),
-        'feasibility_volation': RunningAverage(output_transform=lambda x: x),
-    }
+    # these get populated automatically
+    metrics = {}
 
     progress_bar = tqdm.trange(args.max_epochs)
     for epoch in progress_bar:
@@ -251,61 +288,45 @@ if __name__ == '__main__':
             else:
                 optimizer.step()
 
-            for name, avg in train_metrics.items():
-                avg.update(cmp.state.misc[name])
+            for name, value in cmp.state.misc.items():
+                name = 'train/' + name
+                if name not in metrics:
+                    metrics[name] = RunningAverage(output_transform=lambda x: x)
+                metrics[name].update(value)
 
         model.eval()
         with torch.no_grad():
+
+            imgs = []
+
             for batch in test_loader:
                 batch = train_set.norm(*batch)
 
                 (c, A, b, x, f), (c_pred, A_pred, b_pred, x_pred, f_pred) = cmp.sample(model, batch)
-                # two eval metrics we care about
-                # 1. is the predicted solution feasible wrt to the true parameters?
-                obj = torch.bmm(c, x_pred).squeeze(2)
-                # 2. how good is the predicted solution wrt to the true parameters?
-                constr = torch.bmm(A, x_pred)
-                if args.slack:
-                    feas = torch.isclose(constr, b)
-                else:
-                    feas = constr < b
 
-                constr_volation = (b[~feas] - constr[~feas])/b[~feas]
-                all_feas = feas.all(dim=1)
-                # sub_optimality = (f[all_feas] - obj[all_feas])/f[all_feas]
-                sub_optimality = (f - obj)/f
+                if args.solve_exact:
+                    if args.constr == 'eq':
+                        f_pred, x_pred, solve_success = solve_batch(c_pred, A_eq=A_pred, b_eq=b_pred, workers=args.workers)
+                    elif args.constr == 'ineq':
+                        f_pred, x_pred, solve_success = solve_batch(c_pred, A_ub=A_pred, b_ub=b_pred, workers=args.workers)
 
-                val_metrics['n_feasible'].update((feas.sum()/feas.numel()).item())
-                val_metrics['feasibility_volation'].update(constr_volation.mean().item())
-                val_metrics['sub_optimality'].update(sub_optimality.mean().item())
+                for name, value in get_val_metrics(c, A, b, x_pred, f, args.constr).items():
+                    name = 'val/' + name
+                    if name not in metrics:
+                        metrics[name] = RunningAverage(output_transform=lambda x: x)
+                    metrics[name].update(value)
 
-            #     cca = CCA()
-            batch = tuple(x.unsqueeze(0) for x in test_set[0])
-            batch = train_set.norm(*batch)
-            (c_gt, A_gt, b_gt, x_gt, f_gt), (c_pred, A_pred, b_pred, x_pred, f_pred) = cmp.sample(model, batch)
-            A_gt, b_gt, c_gt, x_gt, f_gt = A_gt.squeeze().cpu(), b_gt.squeeze(0).cpu(), c_gt.squeeze().cpu(), x_gt.squeeze(0).cpu(), f_gt.cpu()
-            A_pred, b_pred, c_pred, x_pred, f_pred = A_pred.squeeze().cpu(), b_pred.squeeze(0).cpu(), c_pred.squeeze().cpu(), x_pred.squeeze(0).cpu(), f_pred.cpu()
-            gt_img = render_problem(A_gt, b_gt, c_gt, x_gt, f_gt)
-            pred_img = render_problem(A_pred, b_pred, c_pred, x_pred, f_pred)
+                # render the first problem in each batch
+                true_problem = render_problem(c[0], A[0], b[0], x[0], f[0])
+                pred_problem = render_problem(c_pred[0], A_pred[0], b_pred[0], x_pred[0], f_pred[0])
+                imgs.append(torch.cat([true_problem, pred_problem], dim=1))
+
             if args.use_wandb:
-                img = wandb.Image(torch.cat([gt_img, pred_img], dim=1), caption='left: ground truth, right: prediction')
-                wandb.log({"problem": img}, step=epoch)
+                img = wandb.Image(make_grid(imgs), caption='left: ground truth, right: prediction')
+                wandb.log({"examples": img}, step=epoch)
 
-        train_metrics_log = {name: avg.compute() for name, avg in train_metrics.items()}
-        train_metrics_log['total_loss'] = train_metrics_log['constr_volation']
-        if args.target == 'aoe_c_only' or args.target == 'aoe':
-            train_metrics_log['total_loss'] += train_metrics_log['aoe']
-        elif args.target == 'f_c_only' or args.target == 'f':
-            train_metrics_log['total_loss'] += train_metrics_log['obj']
-
-        val_metrics_log = {name: avg.compute() for name, avg in val_metrics.items()}
-
-        progress_bar.set_postfix(dict(**train_metrics_log, **val_metrics_log))
         if args.use_wandb:
-            wandb.log(train_metrics_log, step=epoch)
+            wandb.log({name: avg.compute() for name, avg in metrics.items()}, step=epoch)
 
-        for avg in train_metrics.values():
-            avg.reset()
-
-        for avg in val_metrics.values():
+        for avg in metrics.values():
             avg.reset()
