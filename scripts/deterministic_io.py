@@ -24,20 +24,23 @@ from models.deterministic_lp import DeterministicLP
 from scipy.optimize import linprog
 
 def solve_batch(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None, workers=None):
-    if A_ub is None:
-        A_ub = [None]*len(c)
-    if b_ub is None:
-        b_ub = [None]*len(c)
-    if A_eq is None:
-        A_eq = [None]*len(c)
-    if b_eq is None:
-        b_eq = [None]*len(c)
+    c = c.cpu()
+    A_ub = A_ub.cpu() if A_ub is not None else [None]*len(c)
+    b_ub = b_ub.cpu() if b_ub is not None else [None]*len(c)
+    A_eq = A_eq.cpu() if A_eq is not None else [None]*len(c)
+    b_eq = b_eq.cpu() if b_eq is not None else [None]*len(c)
+    bounds = [(None, None)]*len(c) # x does not have non-negativity constraints in the synthetic LP dataset
 
     with mp.Pool(processes=workers) as workers:
-        results = workers.starmap(linprog, zip(c, A_ub, b_ub, A_eq, b_eq))
+        results = workers.starmap(linprog, zip(c, A_ub, b_ub, A_eq, b_eq, bounds))
 
-    f, x, success = zip(*[(result.fun, result.x, result.success) for result in results])
-    return f, x, success
+    f, x, success = zip(*[(result.fun, result.x, result.success) for result in results if result.success])
+    # Creating a tensor from a list of numpy.ndarrays is extremely slow.
+    # Please consider converting the list to a single numpy.ndarray with numpy.array() before converting to a tensor
+    f = np.array(f)
+    x = np.array(x)
+    success = np.array(success)
+    return torch.Tensor(f).unsqueeze(1), torch.Tensor(x).unsqueeze(2), torch.Tensor(success)
 
 
 def get_val_metrics(c, A, b, x_pred, f, constr_type):
@@ -221,7 +224,7 @@ def get_argparser():
     train_args.add_argument('--max_epochs', type=int, default=500, help='Maximum number of training epochs')
     train_args.add_argument('--max_hours', type=int, default=3, help='Maximum hours to train')
     train_args.add_argument('--loss', type=str, choices=['md', 'aoe', 'roe', 'f', 'x_pred_obj_err', 'x_true_obj_err', 'x_pred_obj', 'x_true_obj'], default='aoe', help='Minimization target')
-    train_args.add_argument('--extra_constrs', type=str, nargs='*', choices=['x_pred_constr', 'x_true_constr', 'x_pred_obj', 'x_true_obj'], default=[], help='Constraints to add')
+    train_args.add_argument('--extra_constrs', type=str, nargs='*', choices=['x_pred_constr', 'x_true_constr', 'x_pred_obj', 'x_true_obj'], default=['x_pred_constr'], help='Constraints to add')
     train_args.add_argument('--solve_exact', action='store_true', help='Solve the problems exactly during validation')
 
     model_args = parser.add_argument_group('logging', description='Logging arguments')
@@ -307,8 +310,10 @@ if __name__ == '__main__':
                 if args.solve_exact:
                     if args.constr == 'eq':
                         f_pred, x_pred, solve_success = solve_batch(c_pred, A_eq=A_pred, b_eq=b_pred, workers=args.workers)
+                        x_pred = x_pred.to(device)
                     elif args.constr == 'ineq':
                         f_pred, x_pred, solve_success = solve_batch(c_pred, A_ub=A_pred, b_ub=b_pred, workers=args.workers)
+                        x_pred = x_pred.to(device)
 
                 for name, value in get_val_metrics(c, A, b, x_pred, f, args.constr).items():
                     name = 'val/' + name
