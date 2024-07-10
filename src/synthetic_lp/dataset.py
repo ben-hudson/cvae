@@ -1,10 +1,11 @@
 import tarfile
 import torch
 import pathlib
-import typing
+import numpy as np
 
 from collections import namedtuple
 from sklearn.preprocessing import StandardScaler
+from matplotlib import pyplot as plt
 
 SyntheticLPDatapoint = namedtuple("SyntheticLPDatapoint", "u c A b x f")
 
@@ -106,3 +107,80 @@ class SyntheticLPDataset(torch.utils.data.Dataset):
             self.x[index],
             self.f[index]
         )
+
+    @classmethod
+    def render(cls, u, c, A, b, x_opt, f_opt, representation='polytope', mode='rgb_array'):
+        if representation == 'polytope':
+            return cls._render_polytope(u, c, A, b, x_opt, f_opt, mode=mode)
+        elif representation == 'extended_matrix':
+            return cls._render_extended_matrix(u, c, A, b, x_opt, f_opt, mode=mode)
+        else:
+            raise ValueError(f'representation={representation} is not implemented.')
+
+    # assemble a problem into
+    # [0 c^T 0]
+    # [0 I   x]
+    # [1 -A  b]
+    @classmethod
+    def _render_extended_matrix(cls, u, c, A, b, x_opt, f_opt, mode='rgb_array'):
+        assert mode == 'rgb_array', f'mode={mode} is not implemented.'
+
+        first_row = torch.cat([torch.zeros(1, 1, device=c.device), c, torch.zeros(1, 1, device=c.device)], dim=1)
+        secnd_row = torch.cat([torch.zeros_like(x_opt), torch.eye(x_opt.size(0), device=x_opt.device), x_opt], dim=1)
+        third_row = torch.cat([torch.ones_like(b), -A, b], dim=1)
+        array = torch.cat([first_row, secnd_row, third_row])
+
+        rgb_array = torch.stack([array, array, array])
+        return rgb_array
+
+    # render the polytope (for 2D problems)
+    @classmethod
+    def _render_polytope(cls, u, c, A, b, x_opt, f_opt, mode='rgb_array'):
+        fig = plt.gcf()
+        fig.clear()
+
+        ax = plt.gca()
+        ax.set_aspect('equal')
+        ax.set_xlim(-3, 3)
+        ax.set_ylim(-3, 3)
+        cls._draw_polytope(u, c, A, b, x_opt, f_opt, ax)
+
+        if mode == 'human':
+            plt.ion()
+            fig.canvas.draw()
+            fig.show()
+
+        elif mode == 'rgb_array':
+            fig.canvas.draw()
+            data = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+            w, h = fig.canvas.get_width_height()
+            img = data.reshape((int(h), int(w), -1))
+            return img
+
+        else:
+            raise ValueError(f'mode={mode} is not implemented.')
+
+    @classmethod
+    def _draw_polytope(cls, u, c, A, b, x_opt, f_opt, ax, x_lim=None, y_lim=None):
+        if x_lim is None:
+            x_lim = ax.get_xlim()
+        if y_lim is None:
+            y_lim = ax.get_ylim()
+
+        x = np.linspace(*x_lim, 1000)
+        y = np.linspace(*y_lim, 1000)
+        xx, yy = np.meshgrid(x, y)
+
+        ff = c[0]*xx + c[1]*yy
+
+        feasible_mask = np.ones_like(ff, dtype=bool)
+        for coeffs, intercept in zip(A, b):
+            constr_mask = coeffs[0]*xx + coeffs[1]*yy <= intercept
+            feasible_mask &= constr_mask.bool().numpy()
+
+            ax.plot(x, (intercept - coeffs[0]*x) / coeffs[1], ls='--', linewidth=1, alpha=0.5, color='k')
+
+        ff[~feasible_mask] = np.nan
+        ax.contourf(xx, yy, ff)
+
+        ax.plot(*x_opt, marker='^', color='k')

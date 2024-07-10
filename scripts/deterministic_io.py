@@ -5,16 +5,10 @@ import pathlib
 import torch
 import torch.nn.functional as F
 import tqdm
-import typing
 import multiprocessing as mp
 
-from collections import namedtuple
 from cooper import ConstrainedMinimizationProblem as CMP, CMPState
-from itertools import pairwise
-from torch.utils.data import DataLoader, Subset
-from torchvision.ops import MLP
-from sklearn.linear_model import LinearRegression
-from sklearn.cross_decomposition import CCA
+from torch.utils.data import DataLoader
 
 from synthetic_lp.dataset import SyntheticLPDataset
 
@@ -49,7 +43,6 @@ def get_val_metrics(c, A, b, x_pred, f, constr_type):
     # 2. if not, how infeasible is it?
     # 3. how optimal is it?
 
-
     obj = torch.bmm(c, x_pred).squeeze(2)
     constr = torch.bmm(A, x_pred)
     if constr_type == 'eq':
@@ -65,18 +58,6 @@ def get_val_metrics(c, A, b, x_pred, f, constr_type):
         'other/rel_feas_violation': constr_volation.mean(),
         'other/rel_sub_optimality': sub_optimality.mean(),
     }
-
-# assemble the problem into the "extended matrix representation" to visualize:
-# [0 c^T 0]
-# [0 I   x]
-# [1 -A  b]
-def render_problem(c, A, b, x, f):
-    first_row = torch.cat([torch.zeros(1, 1, device=c.device), c, torch.zeros(1, 1, device=c.device)], dim=1)
-    secnd_row = torch.cat([torch.zeros_like(x), torch.eye(x.size(0), device=x.device), x], dim=1)
-    third_row = torch.cat([torch.ones_like(b), -A, b], dim=1)
-
-    img = torch.cat([first_row, secnd_row, third_row])
-    return img
 
 class ForwardOptimization(CMP):
     def __init__(self, unnorm_fun, device, loss, constr, extra_constrs):
@@ -133,7 +114,6 @@ class ForwardOptimization(CMP):
         aoe_loss = x_pred_obj_err.abs().mean()
         roe_loss = torch.abs(f_pred/f - 1).mean() # TODO: implement the scaling invariance constraint here
         f_loss = x_pred_obj.mean() # equivalent to minimizing violation of kkt conditions when we are doing constraint optimization already
-
 
         # pick a loss
         if self.loss == 'md':
@@ -322,8 +302,8 @@ if __name__ == '__main__':
                     metrics[name].update(value)
 
                 # render the first problem in each batch
-                true_problem = render_problem(c[0], A[0], b[0], x[0], f[0])
-                pred_problem = render_problem(c_pred[0], A_pred[0], b_pred[0], x_pred[0], f_pred[0])
+                true_problem = SyntheticLPDataset.render(None, c[0], A[0], b[0], x[0], f[0])
+                pred_problem = SyntheticLPDataset.render(None, c_pred[0], A_pred[0], b_pred[0], x_pred[0], f_pred[0])
                 imgs.append(torch.cat([true_problem, pred_problem], dim=1))
 
             if args.use_wandb:
