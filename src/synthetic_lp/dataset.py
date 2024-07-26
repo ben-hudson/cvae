@@ -136,6 +136,11 @@ class SyntheticLPDataset(torch.utils.data.Dataset):
     # render the polytope (for 2D problems)
     @classmethod
     def _render_polytope(cls, u, c, A, b, x_opt, f_opt, mode='rgb_array'):
+        c = c.cpu().numpy().squeeze()
+        A = A.cpu().numpy().squeeze()
+        b = b.cpu().numpy().squeeze()
+        x_opt = x_opt.cpu().numpy().squeeze()
+
         fig = plt.gcf()
         fig.clear()
 
@@ -176,7 +181,7 @@ class SyntheticLPDataset(torch.utils.data.Dataset):
         feasible_mask = np.ones_like(ff, dtype=bool)
         for coeffs, intercept in zip(A, b):
             constr_mask = coeffs[0]*xx + coeffs[1]*yy <= intercept
-            feasible_mask &= constr_mask.bool().numpy()
+            feasible_mask &= constr_mask
 
             ax.plot(x, (intercept - coeffs[0]*x) / coeffs[1], ls='--', linewidth=1, alpha=0.5, color='k')
 

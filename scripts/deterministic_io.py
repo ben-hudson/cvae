@@ -304,10 +304,11 @@ if __name__ == '__main__':
                 # render the first problem in each batch
                 true_problem = SyntheticLPDataset.render(None, c[0], A[0], b[0], x[0], f[0])
                 pred_problem = SyntheticLPDataset.render(None, c_pred[0], A_pred[0], b_pred[0], x_pred[0], f_pred[0])
-                imgs.append(torch.cat([true_problem, pred_problem], dim=1))
+                imgs.append(np.hstack([true_problem, pred_problem]))
 
             if args.use_wandb:
-                img = wandb.Image(make_grid(imgs), caption='left: ground truth, right: prediction')
+                # img = wandb.Image(make_grid(imgs), caption='left: ground truth, right: prediction')
+                img = wandb.Image(imgs[0], caption='left: ground truth, right: prediction')
                 wandb.log({"examples": img}, step=epoch)
 
         if args.use_wandb:
