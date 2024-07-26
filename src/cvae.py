@@ -40,7 +40,7 @@ class CVAE(nn.Module):
         else:
             raise ValueError(f"unsupported latent distribution {self.latent_dist}")
 
-        latents = posterior.rsample()
-        obs_hat = self.generation_net(torch.cat([context, latents], dim=-1))
+        latents_hat = posterior.rsample()
+        obs_hat = self.generation_net(torch.cat([context, latents_hat], dim=-1))
 
-        return prior, posterior, obs_hat
+        return prior, posterior, latents_hat, obs_hat
