@@ -2,70 +2,45 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torch.distributions import Normal, kl_divergence
-
-class Encoder(nn.Module):
-    def __init__(self, input_dim, latent_dim, hidden_dim_1, hidden_dim_2):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim_1)
-        self.fc2 = nn.Linear(hidden_dim_1, hidden_dim_2)
-
-        # different layers for mean and var
-        self.fc31 = nn.Linear(hidden_dim_2, latent_dim)
-        self.fc32 = nn.Linear(hidden_dim_2, latent_dim)
-
-    def forward(self, x: torch.Tensor, eps: float = 1e-8):
-        hidden = F.silu(self.fc1(x))
-        hidden = F.silu(self.fc2(hidden))
-        mean = self.fc31(hidden)
-        logvar = self.fc32(hidden) + eps
-        return Normal(loc=mean, scale=torch.exp(logvar))
-
-
-class Decoder(nn.Module):
-    def __init__(self, input_dim, obs_dim, hidden_dim_1, hidden_dim_2):
-        super().__init__()
-        # simple MLP
-        self.fc1 = nn.Linear(input_dim, hidden_dim_1)
-        self.fc2 = nn.Linear(hidden_dim_1, hidden_dim_2)
-        self.fc3 = nn.Linear(hidden_dim_2, obs_dim)
-
-    def forward(self, z):
-        hidden = F.silu(self.fc1(z))
-        hidden = F.silu(self.fc2(hidden))
-        y = F.softplus(self.fc3(hidden)) # y's are always going to be positive
-        return y
-
+from torch.distributions import Uniform, Normal
+from torchvision.ops import MLP
 
 class CVAE(nn.Module):
-    def __init__(self, obs_dim: int, condition_dim: int, latent_dim: int, hidden_dim: int) -> None:
+    def __init__(self, context_dim: int, obs_dim: int, latent_dim: int, latent_dist: str = "normal") -> None:
         super(CVAE, self).__init__()
-        self.prior_net = Encoder(condition_dim, latent_dim, hidden_dim, hidden_dim // 2)
-        self.recognition_net = Encoder(obs_dim + condition_dim, latent_dim, hidden_dim, hidden_dim // 2)
-        self.generation_net = Decoder(latent_dim, obs_dim, hidden_dim // 2, hidden_dim)
 
-    def sample(self, condition: torch.Tensor):
-        # first, get the conditioned latent distribution p(z|x)
-        prior = self.prior_net(condition)
-        # take some samples
-        latents = prior.rsample()
-        # and try to reconstruct the observation p(y|x,z)
-        obs_hat = self.generation_net(latents)
-        return prior, obs_hat
+        self.context_dim = context_dim
+        self.obs_dim = obs_dim
+        self.latent_dim = latent_dim
+        self.latent_dist = latent_dist
 
-    def forward(self, obs: torch.Tensor, condition: torch.Tensor, compute_loss: bool = True):
-        # get prior from condition p(z|x), and try to reconstruct observation
-        prior, obs_hat = self.sample(condition)
-        # now, we need to get the posterior q(z|x,y)
-        x = torch.cat([obs, condition], dim=1)
-        posterior = self.recognition_net(x)
+        # p_\theta(latent|context) - outputs the parameters of the latent distribution
+        self.prior_net = MLP(self.context_dim, [128, 128, 64, 64, 32, 32, self.latent_dim*2], activation_layer=torch.nn.SiLU)
+        # p_\theta(decision|context,latent) - takes latent samples and reconstructs them into decisions
+        self.generation_net = MLP(self.context_dim + self.latent_dim, [32, 32, 64, 64, 128, 128, self.obs_dim], activation_layer=torch.nn.SiLU)
+        # q_\phi(latent|context,decision) - latent samples come from here
+        # this is the one we sample from, and then put IT in to the generation net
+        self.recognition_net = MLP(self.context_dim + self.obs_dim, [128, 128, 64, 64, 32, 32, self.latent_dim*2], activation_layer=torch.nn.SiLU)
 
-        if compute_loss:
-            # want reconstructed observation to be close to the observation
-            mse = F.mse_loss(obs_hat, obs).sum()
-            # want posterior to be close to the prior
-            kld = kl_divergence(prior, posterior).sum()
-            return prior, posterior, obs_hat, mse, kld
+    def forward(self, context: torch.Tensor, obs: torch.Tensor, eps: float=1e-6):
+        prior_loc, prior_scale = self.prior_net(context).chunk(2, dim=-1)
+        prior_scale = F.softplus(prior_scale) + eps
+
+        posterior_loc, posterior_scale = self.recognition_net(torch.cat([context, obs], dim=-1)).chunk(2, dim=-1)
+        posterior_scale = F.softplus(posterior_scale) + eps
+
+        if self.latent_dist == "uniform":
+            prior = Uniform(prior_loc, prior_loc + prior_scale)
+            posterior = Uniform(posterior_loc, posterior_loc + posterior_scale)
+
+        elif self.latent_dist == "normal":
+            prior = Normal(prior_loc, prior_scale)
+            posterior = Normal(posterior_loc, posterior_scale)
 
         else:
-            return prior, posterior, obs_hat
+            raise ValueError(f"unsupported latent distribution {self.latent_dist}")
+
+        latents = posterior.rsample()
+        obs_hat = self.generation_net(torch.cat([context, latents], dim=-1))
+
+        return prior, posterior, obs_hat
