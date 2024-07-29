@@ -5,12 +5,15 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python Debugger: train.py",
+            "name": "Python Debugger: Current File with Arguments",
             "type": "debugpy",
             "request": "launch",
-            "program": "scripts/train.py",
+            "program": "${file}",
             "console": "integratedTerminal",
-            "args": "datasets/taxi_4_1000000_3dimsintervention.nc --latent_dim_to_gt --kld_weight 0.001"
+            "args": "${command:pickArgs}",
+            "env": {
+                "CUDA_LAUNCH_BLOCKING": "1"
+            }
         }
     ]
 }
