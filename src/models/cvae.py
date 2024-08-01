@@ -61,5 +61,6 @@ class CVAE(nn.Module):
         latents_hat = latents_hat.permute(1, 2, 0).flatten(1) # reshape to (batch_size, latent_dim*samples_per_latent)
         # obs_hat = self.generation_net(latents_hat)
         obs_hat = self.generation_net(torch.cat([context, latents_hat], dim=-1))
+        obs_hat = F.sigmoid(obs_hat)
 
         return prior, posterior, latents_hat, obs_hat

@@ -30,3 +30,17 @@ def mean_corr_coef_np(x, y, method='pearson'):
     cc = np.abs(cc)
     score = cc[linear_sum_assignment(-1 * cc)].mean()
     return score
+
+# my own implementation
+def mcc(latents_hat: torch.Tensor, latents: torch.Tensor):
+    latents_hat_np = latents_hat.cpu().numpy()
+    latents_np = latents.cpu().numpy()
+
+    # mean correlation coefficient
+    # from https://github.com/ilkhem/icebeem/blob/0077f0120c83bcc6d9b199b831485c42bed2401f/metrics/mcc.py#L391
+    d = latents_hat_np.shape[1]
+    cc = np.corrcoef(latents_hat_np, latents_np, rowvar=False, dtype=np.float32)
+    cc = np.abs(cc[:d, d:]) # remove self-correlations
+    mcc = cc[linear_sum_assignment(-1 * cc)].mean()
+
+    return mcc
