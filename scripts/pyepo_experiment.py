@@ -9,8 +9,6 @@ import tqdm
 
 from cooper import ConstrainedMinimizationProblem as CMP, CMPState
 from ignite.metrics import RunningAverage
-from scipy.optimize import linear_sum_assignment
-from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import train_test_split
 from torch.distributions import kl_divergence
 from torch.utils.data import DataLoader
@@ -21,26 +19,32 @@ from models.cvae import CVAE
 from metrics import mcc, r2
 
 class PortfolioTrainer(CMP):
-    def __init__(self, unnorm_func, device, portfolio_model):
+    def __init__(self, unnorm_func, device, portfolio_model, costs_are_latents=False):
         super().__init__(is_constrained=True)
 
         self.unnorm = unnorm_func
         self.device = device
         self.portfolio_model = portfolio_model
+        self.costs_are_latents = costs_are_latents
 
     def closure(self, model, batch):
-        feats_normed = batch[0].to(self.device)
-        costs_normed = batch[1].to(self.device)
-        sols_normed = batch[2].to(self.device)
-        objs_normed = batch[3].to(self.device)
+        feats_normed, costs_normed, sols_normed, objs_normed = batch
+        feats_normed = feats_normed.to(self.device)
+        costs_normed = costs_normed.to(self.device)
+        sols_normed = sols_normed.to(self.device)
+        objs_normed = objs_normed.to(self.device)
 
+        if self.costs_are_latents:
+            prior, posterior, costs_hat_normed, sols_hat_normed = model(feats_normed, sols_normed)
+        else:
+            obs_normed = torch.cat([costs_normed, sols_normed], dim=-1)
+            prior, posterior, latents_hat, obs_hat = model(feats_normed, obs_normed)
+            costs_hat_normed, sols_hat_normed = obs_hat.split([costs_normed.size(-1), sols_normed.size(-1)], dim=-1)
+
+        _, costs_hat, sols_hat, _ = self.unnorm(None, costs_hat_normed, sols_hat_normed, None)
         feats, costs, sols, objs = self.unnorm(feats_normed, costs_normed, sols_normed, objs_normed)
 
-        cost_prior, cost_posterior, costs_hat_normed, sols_hat_normed = model(feats_normed, sols_normed)
-        # pass in original features and objs as placeholders
-        _, costs_hat, sols_hat, _ = self.unnorm(None, costs_hat_normed, sols_hat_normed, None)
-
-        kld = kl_divergence(cost_prior, cost_posterior).mean()
+        kld = kl_divergence(prior, posterior).mean()
 
         sols = sols.unsqueeze(2)
         costs = costs.unsqueeze(1)
@@ -96,11 +100,17 @@ class PortfolioTrainer(CMP):
 
     def val(self, model, batch):
         feats_normed, costs_normed, sols_normed, objs_normed = batch
+        prior, latents_hat, obs_hat = model.sample(feats_normed.to(self.device))
+
+        if self.costs_are_latents:
+            costs_hat_normed = latents_hat
+            # costs_hat_normed = prior.loc
+        else:
+            costs_hat_normed, sols_hat_normed = obs_hat.split([costs_normed.size(-1), sols_normed.size(-1)], dim=-1)
+
+        costs_hat_normed = costs_hat_normed.cpu()
 
         feats, costs, sols, objs = self.unnorm(feats_normed, costs_normed, sols_normed, objs_normed)
-
-        cost_prior, _, _ = model.sample(feats_normed.to(self.device))
-        costs_hat_normed = cost_prior.loc.cpu() # mean estimation
         _, costs_hat, _, _ = self.unnorm(costs_normed=costs_hat_normed)
 
         sols_hat, objs_hat = self.solve_batch(costs_hat)
@@ -146,6 +156,8 @@ def get_argparser():
 
     model_args = parser.add_argument_group('model', description='Model arguments')
     model_args.add_argument('--latent_dist', type=str, default='normal', choices=['normal', 'uniform'], help='Latent distribution')
+    model_args.add_argument('--latent_dim', type=int, default=10, help='Latent dimension')
+    model_args.add_argument('--costs_are_latents', action='store_true', help='Costs are the latents (overrides latent_dim)')
 
     train_args = parser.add_argument_group('training', description='Training arguments')
     train_args.add_argument('--no_gpu', action='store_true', help='Do not use the GPU even if one is available')
@@ -193,13 +205,19 @@ if __name__ == '__main__':
         train_loader = DataLoader(train_set, batch_size=min(args.batch_size, len(train_set)), shuffle=True, num_workers=args.workers, drop_last=True)
         test_loader = DataLoader(test_set, batch_size=min(args.batch_size, len(test_set)), shuffle=False, num_workers=args.workers, drop_last=True)
 
-        trainer = PortfolioTrainer(train_set.unnorm, device, portfolio_model)
+        trainer = PortfolioTrainer(train_set.unnorm, device, portfolio_model, costs_are_latents=args.costs_are_latents)
 
     else:
         raise ValueError('NYI')
 
     feats, costs, sols, objs = train_set[0]
-    model = CVAE(feats.size(-1), sols.size(-1), sols.size(-1), args.latent_dist)
+    if args.costs_are_latents:
+        latent_dim = costs.size(-1)
+        obs_dim = sols.size(-1)
+    else:
+        latent_dim = args.latent_dim
+        obs_dim = costs.size(-1) + sols.size(-1)
+    model = CVAE(feats.size(-1), obs_dim, latent_dim, args.latent_dist)
     model.to(device)
 
     formulation = cooper.LagrangianFormulation(trainer)
