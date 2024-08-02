@@ -2,6 +2,7 @@ import argparse
 import cooper
 import numpy as np
 import pyepo
+import pyepo.metric
 import torch
 import torch.nn.functional as F
 import tqdm
@@ -37,7 +38,7 @@ class PortfolioTrainer(CMP):
 
         cost_prior, cost_posterior, costs_hat_normed, sols_hat_normed = model(feats_normed, sols_normed)
         # pass in original features and objs as placeholders
-        _, costs_hat, sols_hat, _ = self.unnorm(feats_normed, costs_hat_normed, sols_hat_normed, objs_normed)
+        _, costs_hat, sols_hat, _ = self.unnorm(None, costs_hat_normed, sols_hat_normed, None)
 
         kld = kl_divergence(cost_prior, cost_posterior).mean()
 
@@ -55,6 +56,10 @@ class PortfolioTrainer(CMP):
             regret,
             satisfaction,
         ], dim=1)
+
+        # regret is the other way around when maximizing
+        if self.portfolio_model.modelSense == pyepo.EPO.MAXIMIZE:
+            eq_constrs *= -1
 
         budget = 1 # budget is hardcoded to 1
         budget_constr = sols_hat.sum(axis=1) - budget
@@ -77,17 +82,35 @@ class PortfolioTrainer(CMP):
         return CMPState(loss=kld, ineq_defect=ineq_constrs, eq_defect=eq_constrs, misc=metrics)
 
     def val(self, model, batch):
-        feats_normed = batch[0].to(self.device)
-        costs_normed = batch[1].to(self.device)
-        sols_normed = batch[2].to(self.device)
-        objs_normed = batch[3].to(self.device)
+        feats_normed, costs_normed, sols_normed, objs_normed = batch
 
         feats, costs, sols, objs = self.unnorm(feats_normed, costs_normed, sols_normed, objs_normed)
-        cost_prior, costs_hat_normed, sols_hat_normed = model.sample(feats_normed)
+
+        cost_prior, _, _ = model.sample(feats_normed.to(self.device))
+        costs_hat_normed = cost_prior.loc.cpu() # mean estimation
+        _, costs_hat, _, _ = self.unnorm(costs_normed=costs_hat_normed)
+
+        sols_hat = []
+        objs_hat = []
+        for cost_hat in costs_hat.cpu().numpy():
+            self.portfolio_model.setObj(cost_hat)
+            sol, obj = self.portfolio_model.solve()
+            sols_hat.append(sol)
+            objs_hat.append(obj)
+        sols_hat = torch.FloatTensor(np.vstack(sols_hat))
+        objs_hat = torch.FloatTensor(np.vstack(objs_hat))
+
+        costs = costs.unsqueeze(1)
+        sols_hat = sols_hat.unsqueeze(2)
+        regret = torch.bmm(costs, sols_hat).squeeze(2) - obj
+
+        if self.portfolio_model.modelSense == pyepo.EPO.MAXIMIZE:
+            regret *= -1
 
         metrics = {
             "mcc": mcc(costs_hat_normed, costs_normed),
-            "r2": r2(costs_hat_normed, costs_normed)
+            "r2": r2(costs_hat_normed, costs_normed),
+            "regret": regret.mean(),
         }
 
         return metrics
@@ -217,9 +240,9 @@ if __name__ == '__main__':
         model.eval()
         with torch.no_grad():
             for batch in test_loader:
-                metrics = trainer.val(model, batch)
+                val_metrics = trainer.val(model, batch)
 
-                for name, value in metrics.items():
+                for name, value in val_metrics.items():
                     name = 'val/' + name
                     if name not in metrics:
                         metrics[name] = RunningAverage(output_transform=lambda x: x)

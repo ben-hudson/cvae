@@ -1,2 +1,2 @@
 from .mcc import *
-from .r2_score import *
+from .r2 import *
