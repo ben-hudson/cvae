@@ -81,6 +81,19 @@ class PortfolioTrainer(CMP):
 
         return CMPState(loss=kld, ineq_defect=ineq_constrs, eq_defect=eq_constrs, misc=metrics)
 
+    # unfortunately, we can't multithread this because the gurobi model is not picklable
+    def solve_batch(self, costs):
+        sols = []
+        objs = []
+        for cost in costs.cpu().numpy():
+            self.portfolio_model.setObj(cost)
+            sol, obj = self.portfolio_model.solve()
+            sols.append(sol)
+            objs.append(obj)
+        sols = np.vstack(sols)
+        objs = np.vstack(objs)
+        return torch.FloatTensor(sols), torch.FloatTensor(objs)
+
     def val(self, model, batch):
         feats_normed, costs_normed, sols_normed, objs_normed = batch
 
@@ -90,19 +103,11 @@ class PortfolioTrainer(CMP):
         costs_hat_normed = cost_prior.loc.cpu() # mean estimation
         _, costs_hat, _, _ = self.unnorm(costs_normed=costs_hat_normed)
 
-        sols_hat = []
-        objs_hat = []
-        for cost_hat in costs_hat.cpu().numpy():
-            self.portfolio_model.setObj(cost_hat)
-            sol, obj = self.portfolio_model.solve()
-            sols_hat.append(sol)
-            objs_hat.append(obj)
-        sols_hat = torch.FloatTensor(np.vstack(sols_hat))
-        objs_hat = torch.FloatTensor(np.vstack(objs_hat))
+        sols_hat, objs_hat = self.solve_batch(costs_hat)
 
         costs = costs.unsqueeze(1)
         sols_hat = sols_hat.unsqueeze(2)
-        regret = torch.bmm(costs, sols_hat).squeeze(2) - obj
+        regret = torch.bmm(costs, sols_hat).squeeze(2) - objs
 
         if self.portfolio_model.modelSense == pyepo.EPO.MAXIMIZE:
             regret *= -1
@@ -140,9 +145,7 @@ def get_argparser():
     dataset_args.add_argument('--workers', type=int, default=2, help='Number of DataLoader workers')
 
     model_args = parser.add_argument_group('model', description='Model arguments')
-    # model_args.add_argument('--latent_dim', type=int, default=10, help='Latent dimension')
     model_args.add_argument('--latent_dist', type=str, default='normal', choices=['normal', 'uniform'], help='Latent distribution')
-    # model_args.add_argument('--samples_per_latent', type=int, default=1, help='Samples drawn from each latent to generate observation')
 
     train_args = parser.add_argument_group('training', description='Training arguments')
     train_args.add_argument('--no_gpu', action='store_true', help='Do not use the GPU even if one is available')
@@ -184,7 +187,7 @@ if __name__ == '__main__':
         portfolio_model = pyepo.model.grb.portfolioModel(n_assets, cov, gamma)
 
         indices = torch.randperm(len(costs))
-        train_indices, test_indices = train_test_split(indices, test_size=0.2)
+        train_indices, test_indices = train_test_split(indices, test_size=1000)
         train_set = PortfolioDataset(portfolio_model, feats[train_indices], costs[train_indices], norm=True)
         test_set = PortfolioDataset(portfolio_model, feats[test_indices], costs[test_indices], norm=False)
         train_loader = DataLoader(train_set, batch_size=min(args.batch_size, len(train_set)), shuffle=True, num_workers=args.workers, drop_last=True)
