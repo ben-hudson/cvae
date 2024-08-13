@@ -1,10 +1,8 @@
 import argparse
 import cooper
-import numpy as np
 import pyepo
 import pyepo.metric
 import torch
-import torch.nn.functional as F
 import tqdm
 
 from cooper import ConstrainedMinimizationProblem as CMP, CMPState
@@ -38,11 +36,11 @@ class PortfolioTrainer(CMP):
             prior, posterior, costs_hat_normed, sols_hat_normed = model(feats_normed, sols_normed)
         else:
             obs_normed = torch.cat([costs_normed, sols_normed], dim=-1)
-            prior, posterior, latents_hat, obs_hat = model(feats_normed, obs_normed)
+            prior, posterior, _, obs_hat = model(feats_normed, obs_normed)
             costs_hat_normed, sols_hat_normed = obs_hat.split([costs_normed.size(-1), sols_normed.size(-1)], dim=-1)
 
         _, costs_hat, sols_hat, _ = self.unnorm(None, costs_hat_normed, sols_hat_normed, None)
-        feats, costs, sols, objs = self.unnorm(feats_normed, costs_normed, sols_normed, objs_normed)
+        _, costs, sols, objs = self.unnorm(feats_normed, costs_normed, sols_normed, objs_normed)
 
         kld = kl_divergence(prior, posterior).mean()
 
@@ -85,47 +83,31 @@ class PortfolioTrainer(CMP):
 
         return CMPState(loss=kld, ineq_defect=ineq_constrs, eq_defect=eq_constrs, misc=metrics)
 
-    # unfortunately, we can't multithread this because the gurobi model is not picklable
-    def solve_batch(self, costs):
-        sols = []
-        objs = []
-        for cost in costs.cpu().numpy():
-            self.portfolio_model.setObj(cost)
-            sol, obj = self.portfolio_model.solve()
-            sols.append(sol)
-            objs.append(obj)
-        sols = np.vstack(sols)
-        objs = np.vstack(objs)
-        return torch.FloatTensor(sols), torch.FloatTensor(objs)
-
     def val(self, model, batch):
         feats_normed, costs_normed, sols_normed, objs_normed = batch
-        prior, latents_hat, obs_hat = model.sample(feats_normed.to(self.device))
+        prior, latents_hat, obs_hat = model.sample(feats_normed.to(self.device), mean=True)
 
         if self.costs_are_latents:
             costs_hat_normed = latents_hat
-            # costs_hat_normed = prior.loc
         else:
-            costs_hat_normed, sols_hat_normed = obs_hat.split([costs_normed.size(-1), sols_normed.size(-1)], dim=-1)
-
+            costs_hat_normed, _ = obs_hat.split([costs_normed.size(-1), sols_normed.size(-1)], dim=-1)
         costs_hat_normed = costs_hat_normed.cpu()
 
-        feats, costs, sols, objs = self.unnorm(feats_normed, costs_normed, sols_normed, objs_normed)
         _, costs_hat, _, _ = self.unnorm(costs_normed=costs_hat_normed)
+        _, costs, _, objs = self.unnorm(costs_normed=costs_normed, objs_normed=objs_normed)
 
-        sols_hat, objs_hat = self.solve_batch(costs_hat)
-
-        costs = costs.unsqueeze(1)
-        sols_hat = sols_hat.unsqueeze(2)
-        regret = torch.bmm(costs, sols_hat).squeeze(2) - objs
-
-        if self.portfolio_model.modelSense == pyepo.EPO.MAXIMIZE:
-            regret *= -1
+        total_regret = 0
+        total_obj = 0
+        for i in range(costs.size(-1)):
+            obj = objs[i].item()
+            total_regret += pyepo.metric.calRegret(self.portfolio_model, costs_hat[i], costs[i], obj)
+            total_obj += abs(obj)
 
         metrics = {
             "mcc": mcc(costs_hat_normed, costs_normed),
             "r2": r2(costs_hat_normed, costs_normed),
-            "regret": regret.mean(),
+            "total_regret": total_regret,
+            "total_obj": total_obj,
         }
 
         return metrics
@@ -270,7 +252,10 @@ if __name__ == '__main__':
                     metrics[name].update(value)
 
         if args.use_wandb:
-            wandb.log({name: avg.compute() for name, avg in metrics.items()}, step=epoch)
+            log = {name: avg.compute() for name, avg in metrics.items()}
+            log['val/regret_norm'] = log['val/total_regret'] / (log['val/total_obj'] + 1e-7)
+
+            wandb.log(log, step=epoch)
 
         for avg in metrics.values():
             avg.reset()
