@@ -1,11 +1,12 @@
 import pyepo
 import torch
-import torch.nn. functional as F
+import torch.nn.functional as F
 
 from cooper import ConstrainedMinimizationProblem as CMP, CMPState
 from metrics import r2, mcc
 from pyepo.metric import calRegret
 from torch.distributions import kl_divergence
+
 
 class PortfolioTrainer(CMP):
     def __init__(self, unnorm_func, device, portfolio_model, costs_are_latents=False, kld_weight=1):
@@ -36,7 +37,7 @@ class PortfolioTrainer(CMP):
 
         kld = kl_divergence(prior, posterior).mean()
         mse = F.mse_loss(costs_hat_normed, costs_normed, reduce="mean")
-        loss = self.kld_weight*kld + (1 - self.kld_weight)*mse
+        loss = self.kld_weight * kld + (1 - self.kld_weight) * mse
 
         sols = sols.unsqueeze(2)
         costs = costs.unsqueeze(1)
@@ -45,28 +46,38 @@ class PortfolioTrainer(CMP):
         objs_hat = torch.bmm(costs_hat, sols_hat).squeeze(2)
 
         regret = torch.bmm(costs, sols_hat).squeeze(2) - objs
-        satisfaction = torch.bmm(costs_hat, sols).squeeze(2) - objs # the opposite of regret, haha
+        satisfaction = torch.bmm(costs_hat, sols).squeeze(2) - objs  # the opposite of regret, haha
 
-        eq_constrs = torch.stack([
-            objs_hat - objs,
-            regret,
-            satisfaction,
-        ], dim=1)
+        eq_constrs = torch.stack(
+            [
+                objs_hat - objs,
+                regret,
+                satisfaction,
+            ],
+            dim=1,
+        )
 
         # regret is the other way around when maximizing
         if self.portfolio_model.modelSense == pyepo.EPO.MAXIMIZE:
             eq_constrs *= -1
 
-        budget = 1 # budget is hardcoded to 1
+        budget = 1  # budget is hardcoded to 1
         budget_constr = sols_hat.sum(axis=1) - budget
 
-        cov = torch.FloatTensor(self.portfolio_model.covariance).to(self.device).expand(sols_hat.size(0), -1, -1) # create batch of covariance matrices
-        risk_constr = torch.bmm(sols_hat.permute(0, 2, 1), torch.bmm(cov, sols_hat)).squeeze(2) - self.portfolio_model.risk_level
+        cov = (
+            torch.FloatTensor(self.portfolio_model.covariance).to(self.device).expand(sols_hat.size(0), -1, -1)
+        )  # create batch of covariance matrices
+        risk_constr = (
+            torch.bmm(sols_hat.permute(0, 2, 1), torch.bmm(cov, sols_hat)).squeeze(2) - self.portfolio_model.risk_level
+        )
 
-        ineq_constrs = torch.stack([
-            budget_constr,
-            risk_constr,
-        ], dim=1)
+        ineq_constrs = torch.stack(
+            [
+                budget_constr,
+                risk_constr,
+            ],
+            dim=1,
+        )
 
         metrics = {
             "loss": loss.detach(),

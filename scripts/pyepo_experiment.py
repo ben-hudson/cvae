@@ -13,6 +13,7 @@ from data.portfolio import PortfolioDataset
 from trainers.portfolio import PortfolioTrainer
 from models.cvae import CVAE
 
+
 def render_shortestpath(obs, grid_size):
     grid = torch.zeros(grid_size, dtype=torch.float32)
 
@@ -25,74 +26,100 @@ def render_shortestpath(obs, grid_size):
 
     return grid
 
+
 def get_argparser():
-    parser = argparse.ArgumentParser('Train an MLP to approximate an LP solver using constrained optimization')
+    parser = argparse.ArgumentParser("Train an MLP to approximate an LP solver using constrained optimization")
 
-    dataset_args = parser.add_argument_group('dataset', description='Dataset arguments')
-    dataset_args.add_argument('dataset', type=str, choices=['portfolio'], help='Dataset to generate')
-    dataset_args.add_argument('--n_samples', type=int, default=100000, help='Number of samples to generate')
-    dataset_args.add_argument('--n_features', type=int, default=5, help='Number of features')
-    dataset_args.add_argument('--degree', type=int, default=1, help='Polynomial degree for encoding function')
-    dataset_args.add_argument('--noise_width', type=float, default=0.5, help='Half-width of latent uniform noise')
-    dataset_args.add_argument('--batch_size', type=int, default=2048, help='Batch size')
-    dataset_args.add_argument('--workers', type=int, default=2, help='Number of DataLoader workers')
+    dataset_args = parser.add_argument_group("dataset", description="Dataset arguments")
+    dataset_args.add_argument("dataset", type=str, choices=["portfolio"], help="Dataset to generate")
+    dataset_args.add_argument("--n_samples", type=int, default=100000, help="Number of samples to generate")
+    dataset_args.add_argument("--n_features", type=int, default=5, help="Number of features")
+    dataset_args.add_argument("--degree", type=int, default=1, help="Polynomial degree for encoding function")
+    dataset_args.add_argument("--noise_width", type=float, default=0.5, help="Half-width of latent uniform noise")
+    dataset_args.add_argument("--batch_size", type=int, default=2048, help="Batch size")
+    dataset_args.add_argument("--workers", type=int, default=2, help="Number of DataLoader workers")
 
-    model_args = parser.add_argument_group('model', description='Model arguments')
-    model_args.add_argument('--latent_dist', type=str, default='normal', choices=['normal', 'uniform'], help='Latent distribution')
-    model_args.add_argument('--latent_dim', type=int, default=10, help='Latent dimension')
-    model_args.add_argument('--costs_are_latents', action='store_true', help='Costs are the latents (overrides latent_dim)')
+    model_args = parser.add_argument_group("model", description="Model arguments")
+    model_args.add_argument(
+        "--latent_dist", type=str, default="normal", choices=["normal", "uniform"], help="Latent distribution"
+    )
+    model_args.add_argument("--latent_dim", type=int, default=10, help="Latent dimension")
+    model_args.add_argument(
+        "--costs_are_latents", action="store_true", help="Costs are the latents (overrides latent_dim)"
+    )
 
-    train_args = parser.add_argument_group('training', description='Training arguments')
-    train_args.add_argument('--no_gpu', action='store_true', help='Do not use the GPU even if one is available')
-    train_args.add_argument('--lr', type=float, default=1e-5, help='Optimizer learning rate')
-    train_args.add_argument('--kld_weight', type=float, default=0.01, help='Relative weighting of KLD and reconstruction loss')
-    train_args.add_argument('--momentum', type=float, default=8e-2, help='Optimizer momentum')
-    train_args.add_argument('--max_epochs', type=int, default=500, help='Maximum number of training epochs')
-    train_args.add_argument('--max_hours', type=int, default=3, help='Maximum hours to train')
-    # cooper related args
-    train_args.add_argument('--dual_restarts', action='store_true', help='Use dual restarts')
-    train_args.add_argument('--no_extra_gradient', action='store_true', help='Use extra-gradient optimizers')
-    # train_args.add_argument('--eq_constrs', type=str, nargs='+', choices=['regret'], help='Maximum hours to train')
+    train_args = parser.add_argument_group("training", description="Training arguments")
+    train_args.add_argument("--no_gpu", action="store_true", help="Do not use the GPU even if one is available")
+    train_args.add_argument("--lr", type=float, default=1e-5, help="Optimizer learning rate")
+    train_args.add_argument(
+        "--kld_weight", type=float, default=0.01, help="Relative weighting of KLD and reconstruction loss"
+    )
+    train_args.add_argument("--momentum", type=float, default=8e-2, help="Optimizer momentum")
+    train_args.add_argument("--max_epochs", type=int, default=500, help="Maximum number of training epochs")
+    train_args.add_argument("--max_hours", type=int, default=3, help="Maximum hours to train")
+    train_args.add_argument("--dual_restarts", action="store_true", help="Use dual restarts")
+    train_args.add_argument("--no_extra_gradient", action="store_true", help="Use extra-gradient optimizers")
 
-
-    model_args = parser.add_argument_group('logging', description='Logging arguments')
-    model_args.add_argument('--wandb_project', type=str, default=None, help='WandB project name')
-    model_args.add_argument('--wandb_exp', type=str, default=None, help='WandB experiment name')
-    model_args.add_argument('--wandb_tags', type=str, nargs='+', default=[], help='WandB tags')
+    model_args = parser.add_argument_group("logging", description="Logging arguments")
+    model_args.add_argument("--wandb_project", type=str, default=None, help="WandB project name")
+    model_args.add_argument("--wandb_exp", type=str, default=None, help="WandB experiment name")
+    model_args.add_argument("--wandb_tags", type=str, nargs="+", default=[], help="WandB tags")
 
     return parser
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     args = get_argparser().parse_args()
     args.use_wandb = args.wandb_project is not None
     args.extra_gradient = not args.no_extra_gradient
 
     if args.use_wandb:
         import wandb
+
         run = wandb.init(
             project=args.wandb_project,
             config=args,
         )
 
-    device = 'cuda:0' if torch.cuda.is_available() and not args.no_gpu else 'cpu'
+    device = "cuda:0" if torch.cuda.is_available() and not args.no_gpu else "cpu"
 
-    if args.dataset == 'portfolio':
+    if args.dataset == "portfolio":
         n_assets = 50
         gamma = 2.25
-        cov, feats, costs = pyepo.data.portfolio.genData(args.n_samples, args.n_features, n_assets, deg=args.degree, noise_level=args.noise_width, seed=135)
+        cov, feats, costs = pyepo.data.portfolio.genData(
+            args.n_samples, args.n_features, n_assets, deg=args.degree, noise_level=args.noise_width, seed=135
+        )
         portfolio_model = pyepo.model.grb.portfolioModel(n_assets, cov, gamma)
 
         indices = torch.randperm(len(costs))
         train_indices, test_indices = train_test_split(indices, test_size=1000)
         train_set = PortfolioDataset(portfolio_model, feats[train_indices], costs[train_indices], norm=True)
         test_set = PortfolioDataset(portfolio_model, feats[test_indices], costs[test_indices], norm=False)
-        train_loader = DataLoader(train_set, batch_size=min(args.batch_size, len(train_set)), shuffle=True, num_workers=args.workers, drop_last=True)
-        test_loader = DataLoader(test_set, batch_size=min(args.batch_size, len(test_set)), shuffle=False, num_workers=args.workers, drop_last=True)
+        train_loader = DataLoader(
+            train_set,
+            batch_size=min(args.batch_size, len(train_set)),
+            shuffle=True,
+            num_workers=args.workers,
+            drop_last=True,
+        )
+        test_loader = DataLoader(
+            test_set,
+            batch_size=min(args.batch_size, len(test_set)),
+            shuffle=False,
+            num_workers=args.workers,
+            drop_last=True,
+        )
 
-        trainer = PortfolioTrainer(train_set.unnorm, device, portfolio_model, costs_are_latents=args.costs_are_latents, kld_weight=args.kld_weight)
+        trainer = PortfolioTrainer(
+            train_set.unnorm,
+            device,
+            portfolio_model,
+            costs_are_latents=args.costs_are_latents,
+            kld_weight=args.kld_weight,
+        )
 
     else:
-        raise ValueError('NYI')
+        raise ValueError("NYI")
 
     feats, costs, sols, objs = train_set[0]
     if args.costs_are_latents:
@@ -116,7 +143,7 @@ if __name__ == '__main__':
         formulation=formulation,
         primal_optimizer=primal_optimizer,
         dual_optimizer=dual_optimizer,
-        dual_restarts=args.dual_restarts
+        dual_restarts=args.dual_restarts,
     )
 
     # these get populated automatically
@@ -137,7 +164,7 @@ if __name__ == '__main__':
                 optimizer.step()
 
             for name, value in trainer.state.misc.items():
-                name = 'train/' + name
+                name = "train/" + name
                 if name not in metrics:
                     metrics[name] = RunningAverage(output_transform=lambda x: x)
                 metrics[name].update(value)
@@ -148,14 +175,14 @@ if __name__ == '__main__':
                 val_metrics = trainer.val(model, batch)
 
                 for name, value in val_metrics.items():
-                    name = 'val/' + name
+                    name = "val/" + name
                     if name not in metrics:
                         metrics[name] = RunningAverage(output_transform=lambda x: x)
                     metrics[name].update(value)
 
         if args.use_wandb:
             log = {name: avg.compute() for name, avg in metrics.items()}
-            log['val/regret_norm'] = log['val/total_regret'] / (log['val/total_obj'] + 1e-7)
+            log["val/regret_norm"] = log["val/total_regret"] / (log["val/total_obj"] + 1e-7)
 
             wandb.log(log, step=epoch)
 
