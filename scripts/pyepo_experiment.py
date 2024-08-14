@@ -17,13 +17,14 @@ from models.cvae import CVAE
 from metrics import mcc, r2
 
 class PortfolioTrainer(CMP):
-    def __init__(self, unnorm_func, device, portfolio_model, costs_are_latents=False):
+    def __init__(self, unnorm_func, device, portfolio_model, costs_are_latents=False, kld_weight=1):
         super().__init__(is_constrained=True)
 
         self.unnorm = unnorm_func
         self.device = device
         self.portfolio_model = portfolio_model
         self.costs_are_latents = costs_are_latents
+        self.kld_weight = kld_weight
 
     def closure(self, model, batch):
         feats_normed, costs_normed, sols_normed, objs_normed = batch
@@ -36,13 +37,15 @@ class PortfolioTrainer(CMP):
             prior, posterior, costs_hat_normed, sols_hat_normed = model(feats_normed, sols_normed)
         else:
             obs_normed = torch.cat([costs_normed, sols_normed], dim=-1)
-            prior, posterior, _, obs_hat = model(feats_normed, obs_normed)
+            prior, posterior, latents_hat, obs_hat = model(feats_normed, obs_normed)
             costs_hat_normed, sols_hat_normed = obs_hat.split([costs_normed.size(-1), sols_normed.size(-1)], dim=-1)
 
         _, costs_hat, sols_hat, _ = self.unnorm(None, costs_hat_normed, sols_hat_normed, None)
-        _, costs, sols, objs = self.unnorm(feats_normed, costs_normed, sols_normed, objs_normed)
+        feats, costs, sols, objs = self.unnorm(feats_normed, costs_normed, sols_normed, objs_normed)
 
         kld = kl_divergence(prior, posterior).mean()
+        mse = torch.nn.functional.mse_loss(costs_hat_normed, costs_normed, reduce="mean")
+        loss = self.kld_weight*kld + (1 - self.kld_weight)*mse
 
         sols = sols.unsqueeze(2)
         costs = costs.unsqueeze(1)
@@ -75,17 +78,20 @@ class PortfolioTrainer(CMP):
         ], dim=1)
 
         metrics = {
+            "loss": loss.detach(),
             "kld": kld.detach(),
+            "cost_mse": mse.detach(),
             "regret": regret.detach().mean(),
+            "satisfaction": satisfaction.detach().mean(),
             "budget_viol": budget_constr.detach().clamp(min=0).mean(),
             "risk_viol": risk_constr.detach().clamp(min=0).mean(),
         }
 
-        return CMPState(loss=kld, ineq_defect=ineq_constrs, eq_defect=eq_constrs, misc=metrics)
+        return CMPState(loss=loss, ineq_defect=ineq_constrs, eq_defect=eq_constrs, misc=metrics)
 
     def val(self, model, batch):
         feats_normed, costs_normed, sols_normed, objs_normed = batch
-        prior, latents_hat, obs_hat = model.sample(feats_normed.to(self.device), mean=True)
+        latents_hat, obs_hat = model.sample(feats_normed.to(self.device), mean=True)
 
         if self.costs_are_latents:
             costs_hat_normed = latents_hat
@@ -151,6 +157,7 @@ def get_argparser():
     # cooper related args
     train_args.add_argument('--dual_restarts', action='store_true', help='Use dual restarts')
     train_args.add_argument('--no_extra_gradient', action='store_true', help='Use extra-gradient optimizers')
+    # train_args.add_argument('--eq_constrs', type=str, nargs='+', choices=['regret'], help='Maximum hours to train')
 
 
     model_args = parser.add_argument_group('logging', description='Logging arguments')
@@ -187,7 +194,7 @@ if __name__ == '__main__':
         train_loader = DataLoader(train_set, batch_size=min(args.batch_size, len(train_set)), shuffle=True, num_workers=args.workers, drop_last=True)
         test_loader = DataLoader(test_set, batch_size=min(args.batch_size, len(test_set)), shuffle=False, num_workers=args.workers, drop_last=True)
 
-        trainer = PortfolioTrainer(train_set.unnorm, device, portfolio_model, costs_are_latents=args.costs_are_latents)
+        trainer = PortfolioTrainer(train_set.unnorm, device, portfolio_model, costs_are_latents=args.costs_are_latents, kld_weight=args.kld_weight)
 
     else:
         raise ValueError('NYI')
