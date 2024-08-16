@@ -9,22 +9,9 @@ from ignite.metrics import RunningAverage
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 
-from data.portfolio import PortfolioDataset
+from data.pyepo import PyEPODataset
 from trainers.portfolio import PortfolioTrainer
 from models.cvae import CVAE
-
-
-def render_shortestpath(obs, grid_size):
-    grid = torch.zeros(grid_size, dtype=torch.float32)
-
-    index = 0
-    for i in range(grid_size[0]):
-        for j in range(grid_size[1]):
-            if i != j:
-                grid[i, j] = obs[index]
-                index += 1
-
-    return grid
 
 
 def get_argparser():
@@ -89,37 +76,26 @@ if __name__ == "__main__":
         cov, feats, costs = pyepo.data.portfolio.genData(
             args.n_samples, args.n_features, n_assets, deg=args.degree, noise_level=args.noise_width, seed=135
         )
-        portfolio_model = pyepo.model.grb.portfolioModel(n_assets, cov, gamma)
+        data_model = pyepo.model.grb.portfolioModel(n_assets, cov, gamma)
 
-        indices = torch.randperm(len(costs))
-        train_indices, test_indices = train_test_split(indices, test_size=1000)
-        train_set = PortfolioDataset(portfolio_model, feats[train_indices], costs[train_indices], norm=True)
-        test_set = PortfolioDataset(portfolio_model, feats[test_indices], costs[test_indices], norm=False)
-        train_loader = DataLoader(
-            train_set,
-            batch_size=min(args.batch_size, len(train_set)),
-            shuffle=True,
-            num_workers=args.workers,
-            drop_last=True,
+    elif args.dataset == "shortestpath":
+        grid = (5, 5)
+        feats, costs = pyepo.data.shortestpath.genData(
+            args.n_samples, args.n_features, grid, deg=args.degree, noise_width=args.noise_width, seed=135
         )
-        test_loader = DataLoader(
-            test_set,
-            batch_size=min(args.batch_size, len(test_set)),
-            shuffle=False,
-            num_workers=args.workers,
-            drop_last=True,
-        )
-
-        trainer = PortfolioTrainer(
-            train_set.unnorm,
-            device,
-            portfolio_model,
-            costs_are_latents=args.costs_are_latents,
-            kld_weight=args.kld_weight,
-        )
+        data_model = pyepo.model.grb.shortestPathModel(grid)
 
     else:
         raise ValueError("NYI")
+
+    indices = torch.randperm(len(costs))
+    train_indices, test_indices = train_test_split(indices, test_size=1000)
+    train_set = PyEPODataset(data_model, feats[train_indices], costs[train_indices], norm=True)
+    test_set = PyEPODataset(data_model, feats[test_indices], costs[test_indices], norm=False)
+
+    train_bs, test_bs = min(args.batch_size, len(train_set)), min(args.batch_size, len(test_set))
+    train_loader = DataLoader(train_set, batch_size=train_bs, shuffle=True, num_workers=args.workers, drop_last=True)
+    test_loader = DataLoader(test_set, batch_size=test_bs, shuffle=False, num_workers=args.workers, drop_last=True)
 
     feats, costs, sols, objs = train_set[0]
     if args.costs_are_latents:
@@ -130,6 +106,27 @@ if __name__ == "__main__":
         obs_dim = costs.size(-1) + sols.size(-1)
     model = CVAE(feats.size(-1), obs_dim, latent_dim, args.latent_dist)
     model.to(device)
+
+    if args.dataset == "portfolio":
+        trainer = PortfolioTrainer(
+            train_set.unnorm,
+            device,
+            data_model,
+            costs_are_latents=args.costs_are_latents,
+            kld_weight=args.kld_weight,
+        )
+
+    elif args.dataset == "shortestpath":
+        trainer = PortfolioTrainer(
+            train_set.unnorm,
+            device,
+            data_model,
+            costs_are_latents=args.costs_are_latents,
+            kld_weight=args.kld_weight,
+        )
+
+    else:
+        raise ValueError("NYI")
 
     formulation = cooper.LagrangianFormulation(trainer)
     if args.extra_gradient:
