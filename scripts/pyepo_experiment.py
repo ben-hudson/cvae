@@ -12,13 +12,14 @@ from torch.utils.data import DataLoader
 from data.pyepo import PyEPODataset
 from trainers.portfolio import PortfolioTrainer
 from models.cvae import CVAE
+from trainers.lp import LPTrainer
 
 
 def get_argparser():
     parser = argparse.ArgumentParser("Train an MLP to approximate an LP solver using constrained optimization")
 
     dataset_args = parser.add_argument_group("dataset", description="Dataset arguments")
-    dataset_args.add_argument("dataset", type=str, choices=["portfolio"], help="Dataset to generate")
+    dataset_args.add_argument("dataset", type=str, choices=["shortestpath", "portfolio"], help="Dataset to generate")
     dataset_args.add_argument("--n_samples", type=int, default=100000, help="Number of samples to generate")
     dataset_args.add_argument("--n_features", type=int, default=5, help="Number of features")
     dataset_args.add_argument("--degree", type=int, default=1, help="Polynomial degree for encoding function")
@@ -27,6 +28,8 @@ def get_argparser():
     dataset_args.add_argument("--workers", type=int, default=2, help="Number of DataLoader workers")
 
     model_args = parser.add_argument_group("model", description="Model arguments")
+    model_args.add_argument("--mlp_hidden_dim", type=int, default=64, help="Dimension of hidden layers in MLPs")
+    model_args.add_argument("--mlp_hidden_layers", type=int, default=2, help="Number of hidden layers in MLPs")
     model_args.add_argument(
         "--latent_dist", type=str, default="normal", choices=["normal", "uniform"], help="Latent distribution"
     )
@@ -104,7 +107,7 @@ if __name__ == "__main__":
     else:
         latent_dim = args.latent_dim
         obs_dim = costs.size(-1) + sols.size(-1)
-    model = CVAE(feats.size(-1), obs_dim, latent_dim, args.latent_dist)
+    model = CVAE(feats.size(-1), obs_dim, args.mlp_hidden_dim, args.mlp_hidden_layers, latent_dim, args.latent_dist)
     model.to(device)
 
     if args.dataset == "portfolio":
@@ -117,10 +120,11 @@ if __name__ == "__main__":
         )
 
     elif args.dataset == "shortestpath":
-        trainer = PortfolioTrainer(
+        trainer = LPTrainer(
             train_set.unnorm,
             device,
             data_model,
+            is_integer=train_set.is_integer,
             costs_are_latents=args.costs_are_latents,
             kld_weight=args.kld_weight,
         )
@@ -179,7 +183,8 @@ if __name__ == "__main__":
 
         if args.use_wandb:
             log = {name: avg.compute() for name, avg in metrics.items()}
-            log["val/regret_norm"] = log["val/total_regret"] / (log["val/total_obj"] + 1e-7)
+            log["train/pyepo_regret_norm"] = log["train/total_pyepo_regret"] / (log["train/total_obj"] + 1e-7)
+            log["val/pyepo_regret_norm"] = log["val/total_pyepo_regret"] / (log["val/total_obj"] + 1e-7)
 
             wandb.log(log, step=epoch)
 

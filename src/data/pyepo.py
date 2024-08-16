@@ -1,9 +1,12 @@
+import networkx as nx
+import numpy as np
+import pyepo
 import pyepo.data
 import pyepo.model
 import torch
-import pyepo
 
 from collections import namedtuple
+from matplotlib import pyplot as plt
 
 PyEPODatapoint = namedtuple("PyEPODatapoint", "feats costs sols objs")
 
@@ -115,3 +118,31 @@ class PyEPODataset(pyepo.data.dataset.optDataset):
     @property
     def risk_level(self):
         return self.model.risk_level
+
+
+def render_shortestpath(data_model, sol):
+    graph = nx.Graph()
+    for (i, j), x in zip(data_model._getArcs(), sol):
+        graph.add_edge(i, j, width=x)
+
+    fig = plt.figure(figsize=(1, 1))
+    ax = plt.gca()
+    ax.set_aspect("equal")
+
+    nodes_x, nodes_y = np.unravel_index(graph.nodes, data_model.grid)
+    node_pos = {n: (x, y) for n, x, y in zip(graph.nodes, nodes_x, nodes_y)}
+    nx.draw_networkx_nodes(graph, pos=node_pos, node_size=25, node_color="grey")
+    # nx.draw_networkx_labels(graph, pos=node_pos, ax=ax)
+
+    edge_widths = nx.get_edge_attributes(graph, "width")
+    nx.draw_networkx_edges(graph, pos=node_pos, edgelist=list(edge_widths.keys()), width=list(edge_widths.values()))
+
+    return fig_to_rgb_tensor(fig)
+
+
+def fig_to_rgb_tensor(fig):
+    fig.canvas.draw()
+    data = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+    w, h = fig.canvas.get_width_height()
+    img = data.reshape((int(h), int(w), -1)).copy()
+    return torch.FloatTensor(img)

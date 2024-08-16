@@ -3,10 +3,10 @@ import numpy as np
 import pyepo
 import pyepo.metric
 import torch
-import torch.nn.functional as F
 import tqdm
 
-from ignite.metrics import RunningAverage
+from ignite.metrics import Average
+from metrics.util import get_val_metrics_sample
 
 
 def get_argparser():
@@ -81,7 +81,7 @@ if __name__ == "__main__":
     ]
     metrics = {}
     for name in metric_names:
-        metrics[name] = RunningAverage(output_transform=lambda x: x)
+        metrics[name] = Average()
 
     for i in tqdm.trange(len(costs)):
         cost_true = costs[i]
@@ -103,21 +103,15 @@ if __name__ == "__main__":
         sol_pred, obj_pred = data_model.solve()
         sol_pred = torch.FloatTensor(sol_pred)
 
-        obj_realized = torch.dot(cost_true, sol_pred)
+        sample_metrics = get_val_metrics_sample(
+            data_model, cost_true, cost_pred, sol_true, sol_pred, obj_true, obj_pred, is_integer
+        )
 
-        spo = obj_realized - obj_true
-        regret = obj_realized - obj_pred
-        cost_err = F.mse_loss(cost_pred, cost_true)
-        if is_integer:
-            decision_err = F.binary_cross_entropy(sol_pred, sol_true)
-        else:
-            decision_err = F.mse_loss(sol_pred, sol_true)
-
-        metrics["val/cost_err"].update(cost_err)
-        metrics["val/decision_err"].update(decision_err)
-        metrics["val/regret"].update(regret)
-        metrics["val/spo_loss"].update(spo)
-        metrics["val/abs_obj"].update(abs(obj_true))
+        metrics["val/cost_err"].update(sample_metrics.cost_err)
+        metrics["val/decision_err"].update(sample_metrics.decision_err)
+        metrics["val/regret"].update(sample_metrics.regret)
+        metrics["val/spo_loss"].update(sample_metrics.spo_loss)
+        metrics["val/abs_obj"].update(sample_metrics.abs_obj)
 
     log = {name: avg.compute() for name, avg in metrics.items()}
     log["val/pyepo_regret_norm"] = log["val/spo_loss"] / (log["val/abs_obj"] + 1e-7)

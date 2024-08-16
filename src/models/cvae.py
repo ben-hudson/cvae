@@ -7,7 +7,15 @@ from torchvision.ops import MLP
 
 
 class CVAE(nn.Module):
-    def __init__(self, context_dim: int, obs_dim: int, latent_dim: int, latent_dist: str = "normal") -> None:
+    def __init__(
+        self,
+        context_dim: int,
+        obs_dim: int,
+        mlp_hidden_dim: int,
+        mlp_hidden_layers: int,
+        latent_dim: int,
+        latent_dist: str = "normal",
+    ) -> None:
         super(CVAE, self).__init__()
 
         self.context_dim = context_dim
@@ -22,14 +30,15 @@ class CVAE(nn.Module):
         # p_\theta(latent|context) - outputs the parameters of the latent distribution
         # a unit normal distribution
         # p_\theta(decision|context,latent) - takes latent samples and reconstructs them into decisions
+        hidden_layers = [mlp_hidden_dim] * mlp_hidden_layers
         self.generation_net = MLP(
-            self.context_dim + self.latent_dim, [64, 64, 64, self.obs_dim], activation_layer=torch.nn.SiLU
+            self.context_dim + self.latent_dim, hidden_layers + [self.obs_dim], activation_layer=torch.nn.SiLU
         )
         # q_\phi(latent|context,decision) - latent samples come from here
         # this is the one we sample from, and then put IT in to the generation net
         self.recognition_net = MLP(
             self.context_dim + self.obs_dim,
-            [64, 64, 64, self.latent_dim * self.params_per_latent],
+            hidden_layers + [self.latent_dim * self.params_per_latent],
             activation_layer=torch.nn.SiLU,
         )
 
