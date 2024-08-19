@@ -1,5 +1,4 @@
 import argparse
-import cooper
 import pyepo
 import pyepo.metric
 import torch
@@ -9,11 +8,11 @@ from ignite.metrics import Average
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
+from torchvision.ops import MLP
 
-from data.pyepo import PyEPODataset
-from trainers.portfolio import PortfolioTrainer
-from models.cvae import CVAE
-from trainers.lp import LPTrainer
+from data.pyepo import PyEPODataset, render_shortestpath
+from metrics.util import get_val_metrics_sample
+from models.solver_vae import SolverVAE
 
 
 def get_argparser():
@@ -21,7 +20,7 @@ def get_argparser():
 
     dataset_args = parser.add_argument_group("dataset", description="Dataset arguments")
     dataset_args.add_argument("dataset", type=str, choices=["shortestpath", "portfolio"], help="Dataset to generate")
-    dataset_args.add_argument("--n_samples", type=int, default=100000, help="Number of samples to generate")
+    dataset_args.add_argument("--n_samples", type=int, default=2000, help="Number of samples to generate")
     dataset_args.add_argument("--n_features", type=int, default=5, help="Number of features")
     dataset_args.add_argument("--degree", type=int, default=1, help="Polynomial degree for encoding function")
     dataset_args.add_argument("--noise_width", type=float, default=0.5, help="Half-width of latent uniform noise")
@@ -29,35 +28,21 @@ def get_argparser():
     dataset_args.add_argument("--workers", type=int, default=2, help="Number of DataLoader workers")
 
     model_args = parser.add_argument_group("model", description="Model arguments")
+    model_args.add_argument("--model", type=str, choices=["nn", "cvae"], default="cvae", help="Model to predict costs")
     model_args.add_argument("--mlp_hidden_dim", type=int, default=64, help="Dimension of hidden layers in MLPs")
     model_args.add_argument("--mlp_hidden_layers", type=int, default=2, help="Number of hidden layers in MLPs")
-    model_args.add_argument(
-        "--latent_dist", type=str, default="normal", choices=["normal", "uniform"], help="Latent distribution"
-    )
+    model_args.add_argument("--latent_dist", type=str, default="normal", choices=["normal"], help="Latent distribution")
     model_args.add_argument("--latent_dim", type=int, default=10, help="Latent dimension")
-    model_args.add_argument(
-        "--costs_are_latents", action="store_true", help="Costs are the latents (overrides latent_dim)"
-    )
 
     train_args = parser.add_argument_group("training", description="Training arguments")
     train_args.add_argument("--no_gpu", action="store_true", help="Do not use the GPU even if one is available")
     train_args.add_argument("--lr", type=float, default=1e-5, help="Optimizer learning rate")
     train_args.add_argument(
-        "--kld_weight", type=float, default=0.01, help="Relative weighting of KLD and reconstruction loss"
-    )
-    train_args.add_argument(
-        "--reconstruct",
-        type=str,
-        choices=[None, "decisions", "costs"],
-        default=None,
-        help="Reconstruct this observation",
+        "--kld_weight", type=float, default=0.5, help="Relative weighting of KLD and reconstruction loss"
     )
     train_args.add_argument("--momentum", type=float, default=8e-2, help="Optimizer momentum")
     train_args.add_argument("--max_epochs", type=int, default=500, help="Maximum number of training epochs")
     train_args.add_argument("--max_hours", type=int, default=3, help="Maximum hours to train")
-    train_args.add_argument("--unconstrained", action="store_true", help="No not use constrained optimization")
-    train_args.add_argument("--dual_restarts", action="store_true", help="Use dual restarts")
-    train_args.add_argument("--no_extra_gradient", action="store_true", help="Use extra-gradient optimizers")
 
     model_args = parser.add_argument_group("logging", description="Logging arguments")
     model_args.add_argument("--wandb_project", type=str, default=None, help="WandB project name")
@@ -69,17 +54,7 @@ def get_argparser():
 
 if __name__ == "__main__":
     args = get_argparser().parse_args()
-
     args.use_wandb = args.wandb_project is not None
-
-    args.constrained = not args.unconstrained
-    if not args.constrained:
-        # turn off constrained optimization options
-        args.dual_restarts = False
-        args.no_extra_gradient = True
-
-    args.extra_gradient = not args.no_extra_gradient
-
     if args.use_wandb:
         import wandb
 
@@ -118,77 +93,59 @@ if __name__ == "__main__":
     test_loader = DataLoader(test_set, batch_size=test_bs, shuffle=False, num_workers=args.workers, drop_last=True)
 
     feats, costs, sols, objs = train_set[0]
-    if args.costs_are_latents:
-        latent_dim = costs.size(-1)
-        obs_dim = sols.size(-1)
+    if args.model == "cvae":
+        model = SolverVAE(feats.size(-1), sols.size(-1), costs.size(-1), args.mlp_hidden_dim, args.mlp_hidden_layers)
+    elif args.model == "nn":
+        hidden_layers = [args.mlp_hidden_dim] * args.mlp_hidden_layers
+        model = MLP(feats.size(-1), hidden_layers + [costs.size(-1)], activation_layer=torch.nn.SiLU)
     else:
-        latent_dim = args.latent_dim
-        obs_dim = costs.size(-1) + sols.size(-1)
-    model = CVAE(feats.size(-1), obs_dim, args.mlp_hidden_dim, args.mlp_hidden_layers, latent_dim, args.latent_dist)
+        raise ValueError()
     model.to(device)
 
-    if args.dataset == "portfolio":
-        trainer = PortfolioTrainer(
-            train_set.unnorm,
-            device,
-            data_model,
-            costs_are_latents=args.costs_are_latents,
-            kld_weight=args.kld_weight,
-        )
-
-    elif args.dataset == "shortestpath":
-        trainer = LPTrainer(
-            args.constrained,
-            train_set.unnorm,
-            device,
-            data_model,
-            is_integer=train_set.is_integer,
-            costs_are_latents=args.costs_are_latents,
-            kld_weight=args.kld_weight,
-            reconstruct=args.reconstruct,
-        )
-
-    else:
-        raise ValueError("NYI")
-
-    formulation = cooper.LagrangianFormulation(trainer)
-
-    if args.constrained:
-        if args.extra_gradient and args.constrained:
-            primal_optimizer = cooper.optim.ExtraAdam(model.parameters(), lr=args.lr)
-            dual_optimizer = cooper.optim.partial_optimizer(cooper.optim.ExtraAdam, lr=args.lr)
-        else:
-            primal_optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-            dual_optimizer = cooper.optim.partial_optimizer(torch.optim.Adam, lr=args.lr)
-    else:
-        primal_optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-        dual_optimizer = None
-
-    optimizer = cooper.ConstrainedOptimizer(
-        formulation=formulation,
-        primal_optimizer=primal_optimizer,
-        dual_optimizer=dual_optimizer,
-        dual_restarts=args.dual_restarts,
-    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    spo_loss = pyepo.func.SPOPlus(data_model, processes=args.workers)
 
     # these get populated automatically
     metrics = {}
 
     progress_bar = tqdm.trange(args.max_epochs)
     for epoch in progress_bar:
-        for batch in train_loader:
+        for batch_normed in train_loader:
             model.train()
             optimizer.zero_grad()
 
-            lagrangian = formulation.composite_objective(trainer.closure, model, batch)
+            feats_normed, costs_normed, sols_normed, objs_normed = batch_normed
+            feats_normed = feats_normed.to(device)
+            costs_normed = costs_normed.to(device)
+            sols_normed = sols_normed.to(device)
+            objs_normed = objs_normed.to(device)
 
-            formulation.custom_backward(lagrangian)
-            if args.extra_gradient:
-                optimizer.step(trainer.closure, model, batch)
+            feats, costs, sols, objs = train_set.unnorm(feats_normed, costs_normed, sols_normed, objs_normed)
+
+            if args.model == "cvae":
+                kld, costs_pred_normed = model(feats_normed, sols_normed)
+            elif args.model == "nn":
+                costs_pred_normed = model(feats_normed)
+                kld = torch.tensor(0.0)
             else:
-                optimizer.step()
+                raise ValueError()
 
-            for name, value in trainer.state.misc.items():
+            _, costs_pred, _, _ = train_set.unnorm(costs_normed=costs_pred_normed)
+
+            spo = spo_loss(costs_pred, costs, sols, objs)
+            loss = args.kld_weight * kld + (1 - args.kld_weight) * spo
+
+            train_metrics = {
+                "abs_obj": objs.detach().abs().mean(),
+                "kld": kld.detach(),
+                "loss": loss.detach(),
+                "spo_loss": spo.detach().mean(),
+            }
+
+            loss.backward()
+            optimizer.step()
+
+            for name, value in train_metrics.items():
                 name = "train/" + name
                 if name not in metrics:
                     metrics[name] = Average()
@@ -198,15 +155,38 @@ if __name__ == "__main__":
         imgs = []
         with torch.no_grad():
             for batch in test_loader:
-                batch = train_set.norm(*batch)
-                val_metrics, img = trainer.val(model, batch)
-                imgs.append(img)
+                feats, costs, sols, objs = batch
+                feats_normed, costs_normed, sols_normed, objs_normed = train_set.norm(*batch)
 
-                for name, value in val_metrics.items():
-                    name = "val/" + name
-                    if name not in metrics:
-                        metrics[name] = Average()
-                    metrics[name].update(value)
+                if args.model == "cvae":
+                    prior = model.sample(feats_normed.to(device))
+                    costs_pred_normed = prior.loc
+                elif args.model == "nn":
+                    costs_pred_normed = model(feats_normed.to(device))
+                else:
+                    raise ValueError()
+                _, costs_pred, _, _ = train_set.unnorm(costs_normed=costs_pred_normed)
+                costs_pred = costs_pred.cpu()
+
+                for i in range(len(costs)):
+                    data_model.setObj(costs_pred[i])
+                    sol_pred, obj_pred = data_model.solve()
+                    sol_pred = torch.FloatTensor(sol_pred)
+
+                    sample_metrics = get_val_metrics_sample(
+                        data_model, costs[i], sols[i], objs[i], costs_pred[i], sol_pred, obj_pred, train_set.is_integer
+                    )
+
+                    for name, value in sample_metrics._asdict().items():
+                        name = "val/" + name
+                        if name not in metrics:
+                            metrics[name] = Average()
+                        metrics[name].update(value)
+
+                img = torch.cat(
+                    [render_shortestpath(data_model, sols[i]), render_shortestpath(data_model, sol_pred)], dim=0
+                )
+                imgs.append(img)
 
         if args.use_wandb:
             log = {name: avg.compute() for name, avg in metrics.items()}

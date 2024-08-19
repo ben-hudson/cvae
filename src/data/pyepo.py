@@ -137,7 +137,9 @@ def render_shortestpath(data_model, sol):
     edge_widths = nx.get_edge_attributes(graph, "width")
     nx.draw_networkx_edges(graph, pos=node_pos, edgelist=list(edge_widths.keys()), width=list(edge_widths.values()))
 
-    return fig_to_rgb_tensor(fig)
+    img = fig_to_rgb_tensor(fig)
+    plt.close(fig)
+    return img
 
 
 def fig_to_rgb_tensor(fig):

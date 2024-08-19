@@ -4,25 +4,19 @@ import pyepo
 
 from collections import namedtuple
 
-from . import mcc, r2
-
 ValMetrics = namedtuple("ValMetrics", "cost_err decision_err regret spo_loss abs_obj")
 
 
 def get_val_metrics_sample(
     data_model,
     cost_true: torch.Tensor,
-    cost_pred: torch.Tensor,
     sol_true: torch.Tensor,
-    sol_pred: torch.Tensor,
     obj_true,
+    cost_pred: torch.Tensor,
+    sol_pred: torch.Tensor,
     obj_pred,
     is_integer: bool = False,
 ):
-    data_model.setObj(cost_pred)
-    sol_pred, obj_pred = data_model.solve()
-    sol_pred = torch.FloatTensor(sol_pred)
-
     obj_realized = torch.dot(cost_true, sol_pred)
 
     spo = obj_realized - obj_true
