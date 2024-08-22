@@ -146,5 +146,7 @@ def fig_to_rgb_tensor(fig):
     fig.canvas.draw()
     data = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
     w, h = fig.canvas.get_width_height()
-    img = data.reshape((int(h), int(w), -1)).copy()
-    return torch.FloatTensor(img)
+    img_np = data.reshape((int(h), int(w), -1)).copy()
+    # matplotlib puts channels last, pytorch puts channels first
+    img_pt = torch.FloatTensor(img_np).permute(2, 0, 1)
+    return img_pt

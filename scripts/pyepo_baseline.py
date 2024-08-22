@@ -6,16 +6,15 @@ import torch
 import tqdm
 
 from ignite.metrics import Average
-from data.pyepo import render_shortestpath
-from utils.val_metrics import get_sample_val_metrics
+from utils import get_sample_val_metrics, get_wandb_name
 
 
 def get_argparser():
-    parser = argparse.ArgumentParser("Train an MLP to approximate an LP solver using constrained optimization")
+    parser = argparse.ArgumentParser("Run a baseline on a dataset")
 
     dataset_args = parser.add_argument_group("dataset", description="Dataset arguments")
     dataset_args.add_argument("dataset", type=str, choices=["shortestpath", "portfolio"], help="Dataset to generate")
-    dataset_args.add_argument("--n_samples", type=int, default=100000, help="Number of samples to generate")
+    dataset_args.add_argument("--n_samples", type=int, default=2000, help="Number of samples to generate")
     dataset_args.add_argument("--n_features", type=int, default=5, help="Number of features")
     dataset_args.add_argument("--degree", type=int, default=1, help="Polynomial degree for encoding function")
     dataset_args.add_argument("--noise_width", type=float, default=0.5, help="Half-width of latent uniform noise")
@@ -29,30 +28,31 @@ def get_argparser():
 
     model_args = parser.add_argument_group("logging", description="Logging arguments")
     model_args.add_argument("--wandb_project", type=str, default=None, help="WandB project name")
-    model_args.add_argument("--wandb_exp", type=str, default=None, help="WandB experiment name")
     model_args.add_argument("--wandb_tags", type=str, nargs="+", default=[], help="WandB tags")
 
     return parser
 
 
 if __name__ == "__main__":
-    args = get_argparser().parse_args()
+    argparser = get_argparser()
+    args = argparser.parse_args()
+
     args.use_wandb = args.wandb_project is not None
-
-    assert args.noise_width <= 1, "noise width must be at most 1 to prevent negative values"
-
-    rng = np.random.RandomState(args.seed)
-    torch.manual_seed(args.seed)
-
     if args.use_wandb:
         import wandb
 
         run = wandb.init(
             project=args.wandb_project,
             config=args,
+            name=get_wandb_name(args, argparser),
+            tags=["baseline"] + args.wandb_tags,
         )
 
-    # to generate the "oracle" predictions we generate the data with no noise, and then add noise back in to get the dataset
+    rng = np.random.RandomState(args.seed)
+    torch.manual_seed(args.seed)
+
+    # to generate the "oracle" predictions we generate the data with no noise, and then add noise back in to get the observations
+    assert args.noise_width <= 1, "noise width must be at most 1"
     if args.dataset == "shortestpath":
         is_integer = True
         grid = (5, 5)
@@ -73,20 +73,10 @@ if __name__ == "__main__":
     cost_mean = costs.mean(dim=0)
     cost_std = costs.std(dim=0, correction=0)
 
-    metric_names = [
-        "val/cost_err",
-        "val/decision_err",
-        "val/regret",
-        "val/spo_loss",
-        "val/abs_obj",
-    ]
     metrics = {}
+
     objs_true = []
     sols_true = []
-
-    for name in metric_names:
-        metrics[name] = Average()
-
     for i in tqdm.trange(len(costs)):
         cost_true = costs[i]
 
@@ -113,12 +103,11 @@ if __name__ == "__main__":
             data_model, cost_true, sol_true, obj_true, cost_pred, sol_pred, obj_pred, is_integer
         )
 
-        metrics["val/cost_err"].update(sample_metrics.cost_err)
-        metrics["val/decision_err"].update(sample_metrics.decision_err)
-        metrics["val/regret"].update(sample_metrics.regret)
-        metrics["val/spo_loss"].update(sample_metrics.spo_loss)
-        metrics["val/obj_true"].update(sample_metrics.obj_true)
-        metrics["val/obj_realized"].update(sample_metrics.obj_realized)
+        for name, value in sample_metrics._asdict().items():
+            name = "val/" + name
+            if name not in metrics:
+                metrics[name] = Average()
+            metrics[name].update(value)
 
     log = {name: avg.compute() for name, avg in metrics.items()}
     log["val/pyepo_regret_norm"] = log["val/spo_loss"] / (log["val/obj_true"] + 1e-7)
@@ -126,13 +115,6 @@ if __name__ == "__main__":
     if args.use_wandb:
         for epoch in range(args.max_epochs):
             wandb.log(log, step=epoch)
-
-        wandb.log({"val/obj_dist": wandb.Histogram(objs_true)}, step=epoch)
-
-        if args.dataset == "shortestpath":
-            sols_true = torch.stack(sols_true)
-            img = render_shortestpath(data_model, sols_true.mean(dim=0))
-            wandb.log({"val/reconstruction": wandb.Image(img.permute(2, 0, 1))}, step=epoch)
 
     else:
         for name, val in log.items():
