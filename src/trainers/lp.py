@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 from cooper import ConstrainedMinimizationProblem as CMP, CMPState
 from ignite.metrics import Average
-from metrics.util import get_val_metrics_sample
+from utils.val_metrics import get_sample_val_metrics
 from torch.distributions import kl_divergence
 from data.pyepo import render_shortestpath
 
@@ -163,7 +163,7 @@ class LPTrainer(CMP):
             self.lp.setObj(costs_pred[i])
             sol_pred, obj_pred = self.lp.solve()
 
-            sample_metrics = get_val_metrics_sample(
+            sample_metrics = get_sample_val_metrics(
                 self.lp, costs[i], costs_pred[i], sols[i], sol_pred, objs[i], obj_pred, self.is_integer
             )
             metrics["abs_obj"].update(sample_metrics.abs_obj)

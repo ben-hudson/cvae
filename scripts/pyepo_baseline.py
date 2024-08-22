@@ -6,7 +6,8 @@ import torch
 import tqdm
 
 from ignite.metrics import Average
-from metrics.util import get_val_metrics_sample
+from data.pyepo import render_shortestpath
+from utils.val_metrics import get_sample_val_metrics
 
 
 def get_argparser():
@@ -80,6 +81,9 @@ if __name__ == "__main__":
         "val/abs_obj",
     ]
     metrics = {}
+    objs_true = []
+    sols_true = []
+
     for name in metric_names:
         metrics[name] = Average()
 
@@ -89,6 +93,8 @@ if __name__ == "__main__":
         data_model.setObj(cost_true)
         sol_true, obj_true = data_model.solve()
         sol_true = torch.FloatTensor(sol_true)
+        sols_true.append(sol_true)
+        objs_true.append(obj_true)
 
         if args.baseline == "oracle":
             cost_pred = expected_costs[i]
@@ -103,22 +109,30 @@ if __name__ == "__main__":
         sol_pred, obj_pred = data_model.solve()
         sol_pred = torch.FloatTensor(sol_pred)
 
-        sample_metrics = get_val_metrics_sample(
-            data_model, cost_true, cost_pred, sol_true, sol_pred, obj_true, obj_pred, is_integer
+        sample_metrics = get_sample_val_metrics(
+            data_model, cost_true, sol_true, obj_true, cost_pred, sol_pred, obj_pred, is_integer
         )
 
         metrics["val/cost_err"].update(sample_metrics.cost_err)
         metrics["val/decision_err"].update(sample_metrics.decision_err)
         metrics["val/regret"].update(sample_metrics.regret)
         metrics["val/spo_loss"].update(sample_metrics.spo_loss)
-        metrics["val/abs_obj"].update(sample_metrics.abs_obj)
+        metrics["val/obj_true"].update(sample_metrics.obj_true)
+        metrics["val/obj_realized"].update(sample_metrics.obj_realized)
 
     log = {name: avg.compute() for name, avg in metrics.items()}
-    log["val/pyepo_regret_norm"] = log["val/spo_loss"] / (log["val/abs_obj"] + 1e-7)
+    log["val/pyepo_regret_norm"] = log["val/spo_loss"] / (log["val/obj_true"] + 1e-7)
 
     if args.use_wandb:
         for epoch in range(args.max_epochs):
             wandb.log(log, step=epoch)
+
+        wandb.log({"val/obj_dist": wandb.Histogram(objs_true)}, step=epoch)
+
+        if args.dataset == "shortestpath":
+            sols_true = torch.stack(sols_true)
+            img = render_shortestpath(data_model, sols_true.mean(dim=0))
+            wandb.log({"val/reconstruction": wandb.Image(img.permute(2, 0, 1))}, step=epoch)
 
     else:
         for name, val in log.items():

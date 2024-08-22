@@ -210,8 +210,8 @@ if __name__ == "__main__":
 
         if args.use_wandb:
             log = {name: avg.compute() for name, avg in metrics.items()}
-            log["train/pyepo_regret_norm"] = log["train/spo_loss"] / (log["train/abs_obj"] + 1e-7)
-            log["val/pyepo_regret_norm"] = log["val/spo_loss"] / (log["val/abs_obj"] + 1e-7)
+            log["train/pyepo_regret_norm"] = log["train/spo_loss"] / (log["train/obj_true"] + 1e-7)
+            log["val/pyepo_regret_norm"] = log["val/spo_loss"] / (log["val/obj_true"] + 1e-7)
 
             wandb.log(log, step=epoch)
 

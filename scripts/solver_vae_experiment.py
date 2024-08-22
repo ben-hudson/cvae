@@ -11,8 +11,23 @@ from torchvision.utils import make_grid
 from torchvision.ops import MLP
 
 from data.pyepo import PyEPODataset, render_shortestpath
-from metrics.util import get_val_metrics_sample
+from utils.val_metrics import get_sample_val_metrics
+from models.ccsp import ChanceConstrainedShortestPath
 from models.solver_vae import SolverVAE
+
+
+def get_wandb_name(args, argparser):
+    nondefault_values = []
+    for name, value in vars(args).items():
+        default_value = argparser.get_default(name)
+        if value != default_value and not name.startswith("wandb"):
+            nondefault_values.append((name, value))
+
+    if len(nondefault_values) == 0:
+        return None
+
+    name = "_".join(f"{name}:{value}" for name, value in nondefault_values)
+    return name
 
 
 def get_argparser():
@@ -44,6 +59,14 @@ def get_argparser():
     train_args.add_argument("--max_epochs", type=int, default=500, help="Maximum number of training epochs")
     train_args.add_argument("--max_hours", type=int, default=3, help="Maximum hours to train")
 
+    eval_args = parser.add_argument_group("evaluation", description="Evaluation arguments")
+    eval_args.add_argument(
+        "--chance_constraint_budget", type=float, default=None, help="Chance constraint cost threshold"
+    )
+    eval_args.add_argument(
+        "--chance_constraint_prob", type=float, default=0.5, help="Chance constraint probability threshold"
+    )
+
     model_args = parser.add_argument_group("logging", description="Logging arguments")
     model_args.add_argument("--wandb_project", type=str, default=None, help="WandB project name")
     model_args.add_argument("--wandb_exp", type=str, default=None, help="WandB experiment name")
@@ -52,16 +75,30 @@ def get_argparser():
     return parser
 
 
+def get_reconstruction(sol_true, costs_samples):
+    img_true = render_shortestpath(data_model, sol_true)
+
+    sols_pred = []
+    for i in range(len(costs_samples)):
+        data_model.setObj(costs_pred[i])
+        sol_pred, obj_pred = data_model.solve()
+        sols_pred.append(torch.FloatTensor(sol_pred))
+
+    sols_pred = torch.stack(sols_pred)
+    img_pred = render_shortestpath(data_model, sols_pred.mean(dim=0))
+
+    return torch.cat([img_true, img_pred], dim=0)
+
+
 if __name__ == "__main__":
-    args = get_argparser().parse_args()
+    argparser = get_argparser()
+    args = argparser.parse_args()
+
     args.use_wandb = args.wandb_project is not None
     if args.use_wandb:
         import wandb
 
-        run = wandb.init(
-            project=args.wandb_project,
-            config=args,
-        )
+        run = wandb.init(project=args.wandb_project, config=args, name=get_wandb_name(args, argparser))
 
     device = "cuda:0" if torch.cuda.is_available() and not args.no_gpu else "cpu"
 
@@ -136,9 +173,9 @@ if __name__ == "__main__":
             loss = args.kld_weight * kld + (1 - args.kld_weight) * spo
 
             train_metrics = {
-                "abs_obj": objs.detach().abs().mean(),
                 "kld": kld.detach(),
                 "loss": loss.detach(),
+                "obj_true": objs.detach().abs().mean(),
                 "spo_loss": spo.detach().mean(),
             }
 
@@ -159,39 +196,73 @@ if __name__ == "__main__":
                 feats_normed, costs_normed, sols_normed, objs_normed = train_set.norm(*batch)
 
                 if args.model == "cvae":
-                    prior = model.sample(feats_normed.to(device))
-                    costs_pred_normed = prior.loc
+                    prior_normed = model.sample(feats_normed.to(device))
+                    # for a normally distributed random variable X, the transformation aX+b gives a mean of a*u + b and a variance of a^2*var^2
+                    # from https://en.wikipedia.org/wiki/Normal_distribution#Operations_and_functions_of_normal_variables
+                    costs_pred = prior_normed.loc.cpu() * train_set.scales.costs + train_set.means.costs
+                    costs_pred_std = prior_normed.scale.cpu() * train_set.scales.costs
+                    prior = torch.distributions.Normal(costs_pred, costs_pred_std)
+
                 elif args.model == "nn":
                     costs_pred_normed = model(feats_normed.to(device))
+                    _, costs_pred, _, _ = train_set.unnorm(costs_normed=costs_pred_normed)
+                    costs_pred = costs_pred.cpu()
+
                 else:
                     raise ValueError()
-                _, costs_pred, _, _ = train_set.unnorm(costs_normed=costs_pred_normed)
-                costs_pred = costs_pred.cpu()
 
                 for i in range(len(costs)):
-                    data_model.setObj(costs_pred[i])
-                    sol_pred, obj_pred = data_model.solve()
-                    sol_pred = torch.FloatTensor(sol_pred)
+                    try:
+                        if args.chance_constraint_prob > 0.5:
+                            if args.dataset == "shortestpath":
+                                cc_data_model = ChanceConstrainedShortestPath(
+                                    grid,
+                                    prior.loc[i],
+                                    prior.scale[i],
+                                    args.chance_constraint_budget,
+                                    args.chance_constraint_prob,
+                                )
+                            else:
+                                raise Exception("NYI")
+                            sol_pred, obj_pred = cc_data_model.solve()
+                        elif args.chance_constraint_prob == 0.5:
+                            data_model.setObj(costs_pred[i])
+                            sol_pred, obj_pred = data_model.solve()
+                        else:
+                            raise ValueError("Chance constraint probability should be >=0.5 (0.5 is risk-neutral)")
 
-                    sample_metrics = get_val_metrics_sample(
-                        data_model, costs[i], sols[i], objs[i], costs_pred[i], sol_pred, obj_pred, train_set.is_integer
-                    )
+                        sol_pred = torch.FloatTensor(sol_pred)
 
-                    for name, value in sample_metrics._asdict().items():
-                        name = "val/" + name
-                        if name not in metrics:
-                            metrics[name] = Average()
-                        metrics[name].update(value)
+                        sample_metrics = get_sample_val_metrics(
+                            data_model,
+                            costs[i],
+                            sols[i],
+                            objs[i],
+                            costs_pred[i],
+                            sol_pred,
+                            obj_pred,
+                            train_set.is_integer,
+                        )
 
-                img = torch.cat(
-                    [render_shortestpath(data_model, sols[i]), render_shortestpath(data_model, sol_pred)], dim=0
-                )
+                        for name, value in sample_metrics._asdict().items():
+                            name = "val/" + name
+                            if name not in metrics:
+                                metrics[name] = Average()
+                            metrics[name].update(value)
+                    except:
+                        if "val/success" not in metrics:
+                            metrics["val/success"] = Average()
+                        metrics["val/success"].update(0.0)
+
+                costs_normed_samples = prior.sample((1000,))[:, 0, :]
+                _, costs_samples, _, _ = train_set.unnorm(costs_normed=costs_normed_samples)
+                img = get_reconstruction(sols[0], costs_samples)
                 imgs.append(img)
 
         if args.use_wandb:
             log = {name: avg.compute() for name, avg in metrics.items()}
-            log["train/pyepo_regret_norm"] = log["train/spo_loss"] / (log["train/abs_obj"] + 1e-7)
-            log["val/pyepo_regret_norm"] = log["val/spo_loss"] / (log["val/abs_obj"] + 1e-7)
+            log["train/pyepo_regret_norm"] = log["train/spo_loss"] / (log["train/obj_true"] + 1e-7)
+            log["val/pyepo_regret_norm"] = log["val/spo_loss"] / (log["val/obj_true"] + 1e-7)
 
             wandb.log(log, step=epoch)
 
