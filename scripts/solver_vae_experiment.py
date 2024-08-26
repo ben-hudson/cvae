@@ -205,13 +205,14 @@ if __name__ == "__main__":
                         metrics["val/success"].update(0.0)
 
         if args.use_wandb:
-            log = {name: avg.compute() for name, avg in metrics.items()}
-            if "train/spo_loss" in log and "train/obj_true" in log:
+            try:
+                log = {name: avg.compute() for name, avg in metrics.items()}
                 log["train/pyepo_regret_norm"] = log["train/spo_loss"] / (log["train/obj_true"] + 1e-7)
-            if "val/spo_loss" in log and "val/obj_true" in log:
                 log["val/pyepo_regret_norm"] = log["val/spo_loss"] / (log["val/obj_true"] + 1e-7)
+                wandb.log(log, step=epoch)
 
-            wandb.log(log, step=epoch)
+            except:
+                pass
 
         for avg in metrics.values():
             avg.reset()
