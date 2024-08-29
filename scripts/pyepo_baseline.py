@@ -7,6 +7,7 @@ import tqdm
 
 from ignite.metrics import Average
 from utils import get_sample_val_metrics, get_wandb_name
+from models.risk_averse import CVaRShortestPath
 
 
 def get_argparser():
@@ -21,7 +22,9 @@ def get_argparser():
     dataset_args.add_argument("--seed", type=int, default=135, help="RNG seed")
 
     model_args = parser.add_argument_group("model", description="Model arguments")
-    model_args.add_argument("baseline", type=str, choices=["oracle", "random", "mean"], help="Baseline to evaluate")
+    model_args.add_argument(
+        "baseline", type=str, choices=["oracle", "random", "mean", "ra_oracle"], help="Baseline to evaluate"
+    )
 
     train_args = parser.add_argument_group("training", description="Training arguments")
     train_args.add_argument("--max_epochs", type=int, default=500, help="Maximum number of training epochs")
@@ -31,6 +34,18 @@ def get_argparser():
     model_args.add_argument("--wandb_tags", type=str, nargs="+", default=[], help="WandB tags")
 
     return parser
+
+
+def report_metrics(metrics: dict, step: int, use_wandb: bool):
+    log = {name: avg.compute() for name, avg in metrics.items()}
+    log["val/pyepo_regret_norm"] = log["val/spo_loss"] / (log["val/obj_true"] + 1e-7)
+
+    if use_wandb:
+        wandb.log(log, step=step)
+    else:
+        print(f"step: {step}")
+        for name, val in log.items():
+            print(f"{name}: {val:.4f}")
 
 
 if __name__ == "__main__":
@@ -60,24 +75,32 @@ if __name__ == "__main__":
         feats, expected_costs = pyepo.data.shortestpath.genData(
             args.n_samples, args.n_features, grid, deg=args.degree, noise_width=0, seed=args.seed
         )
-        # the shortest path problem has multiplicative uniform noise
-        epsilon = rng.uniform(1 - args.noise_width, 1 + args.noise_width, size=expected_costs.shape)
-        costs = expected_costs * epsilon
+        expected_costs = torch.FloatTensor(expected_costs)
+        noise_halfwidths = expected_costs.abs() * args.noise_width
+        # the way PyEPO generates noise means the lowest cost path is also the most risk-averse path
+        # we shuffle which noise distribution corresponds to which cost so this is not true
+        noise_halfwidths = noise_halfwidths[:, torch.randperm(noise_halfwidths.size(-1))]
+        noise = torch.distributions.Uniform(-noise_halfwidths, noise_halfwidths).sample()
+        costs = expected_costs + noise
 
     else:
         raise ValueError("NYI")
 
-    expected_costs = torch.FloatTensor(expected_costs)
-    costs = torch.FloatTensor(costs)
+    costs_std = noise_halfwidths / np.sqrt(3)
 
-    cost_mean = costs.mean(dim=0)
-    cost_std = costs.std(dim=0, correction=0)
+    cost_marginal_mean = costs.mean(dim=0)
+    cost_marginal_std = costs.std(dim=0, correction=0)
 
     metrics = {}
 
+    # we want to report the running average every so often
+    # so we divide the total number of samples into "batches"
+    batch_size = args.n_samples // args.max_epochs
+
     objs_true = []
     sols_true = []
-    for i in tqdm.trange(len(costs)):
+
+    for i in tqdm.trange(args.n_samples):
         cost_true = costs[i]
 
         data_model.setObj(cost_true)
@@ -86,18 +109,27 @@ if __name__ == "__main__":
         sols_true.append(sol_true)
         objs_true.append(obj_true)
 
-        if args.baseline == "oracle":
+        if args.baseline == "ra_oracle":
             cost_pred = expected_costs[i]
-        elif args.baseline == "random":
-            cost_pred = cost_mean + cost_std * torch.randn_like(cost_true)
-        elif args.baseline == "mean":
-            cost_pred = cost_mean
-        else:
-            raise ValueError(f"unknown baseline {args.model}")
+            cost_pred_std = costs_std[i]
+            ra_data_model = CVaRShortestPath(grid, cost_pred, cost_pred_std, 0.90, tail="right")
+            sol_pred, _ = ra_data_model.solve()
 
-        data_model.setObj(cost_pred)
-        sol_pred, obj_pred = data_model.solve()
-        sol_pred = torch.FloatTensor(sol_pred)
+        else:
+            if args.baseline == "oracle":
+                cost_pred = expected_costs[i]
+            elif args.baseline == "random":
+                cost_pred = cost_marginal_mean + cost_marginal_std * torch.randn_like(cost_true)
+            elif args.baseline == "mean":
+                cost_pred = cost_marginal_mean
+            else:
+                raise ValueError(f"unknown baseline {args.model}")
+
+            data_model.setObj(cost_pred)
+            sol_pred, _ = data_model.solve()
+
+        sol_pred = (torch.FloatTensor(sol_pred) > 0.5).to(torch.float32)
+        obj_pred = torch.dot(cost_pred, sol_pred)
 
         sample_metrics = get_sample_val_metrics(
             data_model, cost_true, sol_true, obj_true, cost_pred, sol_pred, obj_pred, is_integer
@@ -109,13 +141,7 @@ if __name__ == "__main__":
                 metrics[name] = Average()
             metrics[name].update(value)
 
-    log = {name: avg.compute() for name, avg in metrics.items()}
-    log["val/pyepo_regret_norm"] = log["val/spo_loss"] / (log["val/obj_true"] + 1e-7)
+        if i % batch_size == 0:
+            report_metrics(metrics, i // batch_size, args.use_wandb)
 
-    if args.use_wandb:
-        for epoch in range(args.max_epochs):
-            wandb.log(log, step=epoch)
-
-    else:
-        for name, val in log.items():
-            print(f"{name}: {val:.4f}")
+    report_metrics(metrics, args.max_epochs, args.use_wandb)

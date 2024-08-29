@@ -5,11 +5,12 @@ import torch
 import tqdm
 
 from ignite.metrics import Average
+from ignite.exceptions import NotComputableError
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 
 from data.pyepo import PyEPODataset
-from models.ccsp import ChanceConstrainedShortestPath
+from models.risk_averse import CVaRShortestPath
 from models.solver_vae import SolverVAE
 from utils import get_sample_val_metrics, get_wandb_name
 
@@ -44,11 +45,12 @@ def get_argparser():
     train_args.add_argument("--max_hours", type=int, default=3, help="Maximum hours to train")
 
     eval_args = parser.add_argument_group("evaluation", description="Evaluation arguments")
+    eval_args.add_argument("--eval_every", type=int, default=10, help="Evaluate every n epochs")
     eval_args.add_argument(
         "--chance_constraint_budget", type=float, default=None, help="Chance constraint cost threshold"
     )
     eval_args.add_argument(
-        "--chance_constraint_prob", type=float, default=0.5, help="Chance constraint probability threshold"
+        "--risk_level", type=float, default=0.5, help="Risk level (probability) for risk-averse decision-making"
     )
 
     model_args = parser.add_argument_group("logging", description="Logging arguments")
@@ -78,9 +80,18 @@ if __name__ == "__main__":
 
     if args.dataset == "shortestpath":
         grid = (5, 5)
-        feats, costs = pyepo.data.shortestpath.genData(
-            args.n_samples, args.n_features, grid, deg=args.degree, noise_width=args.noise_width, seed=args.seed
+        feats, costs_expected = pyepo.data.shortestpath.genData(
+            args.n_samples, args.n_features, grid, deg=args.degree, noise_width=0, seed=args.seed
         )
+
+        costs_expected = torch.FloatTensor(costs_expected)
+        noise_halfwidths = costs_expected.abs() * args.noise_width
+        # the way PyEPO generates noise means the lowest cost path is also the most risk-averse path
+        # we shuffle which noise distribution corresponds to which cost so this is not true
+        noise_halfwidths = noise_halfwidths[:, torch.randperm(noise_halfwidths.size(-1))]
+        noise = torch.distributions.Uniform(-noise_halfwidths, noise_halfwidths).sample()
+        costs = costs_expected + noise
+
         data_model = pyepo.model.grb.shortestPathModel(grid)
 
     else:
@@ -142,77 +153,77 @@ if __name__ == "__main__":
                     metrics[name] = Average()
                 metrics[name].update(value)
 
-        model.eval()
-        imgs = []
-        with torch.no_grad():
-            for batch in test_loader:
-                feats, costs, sols, objs = batch
-                feats_normed, costs_normed, sols_normed, objs_normed = train_set.norm(*batch)
+        if epoch % args.eval_every == 0:
+            model.eval()
+            with torch.no_grad():
+                for batch in test_loader:
+                    feats, costs, sols, objs = batch
+                    feats_normed, costs_normed, sols_normed, objs_normed = train_set.norm(*batch)
 
-                prior_normed = model.sample(feats_normed.to(device))
-                _, costs_pred, _, _ = train_set.unnorm(costs_normed=prior_normed.loc.cpu())
-                # we have to unnorm the std as well, which is just scale*std
-                # from https://en.wikipedia.org/wiki/Normal_distribution#Operations_and_functions_of_normal_variables
-                costs_pred_std = prior_normed.scale.cpu() * train_set.scales.costs
-                prior = torch.distributions.Normal(costs_pred, costs_pred_std)
+                    prior_normed = model.sample(feats_normed.to(device))
+                    _, costs_pred, _, _ = train_set.unnorm(costs_normed=prior_normed.loc.cpu())
+                    # we have to unnorm the std as well, which is just scale*std
+                    # from https://en.wikipedia.org/wiki/Normal_distribution#Operations_and_functions_of_normal_variables
+                    costs_pred_std = prior_normed.scale.cpu() * train_set.scales.costs
+                    prior = torch.distributions.Normal(costs_pred, costs_pred_std)
 
-                # solve the problems explicitly
-                for i in range(len(costs)):
-                    try:
-                        if args.chance_constraint_prob == 0.5:
-                            # if the decision-making is risk-neutral just use the normal model
-                            data_model.setObj(prior.loc[i])
-                            sol_pred, obj_pred = data_model.solve()
+                    # solve the problems explicitly
+                    for i in range(len(costs)):
+                        try:
+                            if args.risk_level == 0.5:
+                                # if the decision-making is risk-neutral just use the normal model
+                                data_model.setObj(prior.loc[i])
+                                sol_pred, _ = data_model.solve()
 
-                        elif args.chance_constraint_prob > 0.5:
-                            if args.dataset == "shortestpath":
-                                cc_data_model = ChanceConstrainedShortestPath(
-                                    grid,
-                                    prior.loc[i],
-                                    prior.scale[i],
-                                    args.chance_constraint_budget,
-                                    args.chance_constraint_prob,
-                                )
-                                sol_pred, obj_pred = cc_data_model.solve()
                             else:
-                                raise ValueError(f"unknown dataset {args.dataset}")
+                                if args.dataset == "shortestpath":
+                                    ra_data_model = CVaRShortestPath(
+                                        grid, prior.loc[i], prior.scale[i], args.risk_level, tail="right"
+                                    )
+                                    sol_pred, _ = ra_data_model.solve()
+                                else:
+                                    raise ValueError(f"unknown dataset {args.dataset}")
 
-                        else:
-                            raise ValueError("alpha must be at least 0.5 (0.5 corresponds to a risk-neutral decision)")
+                            sol_pred = torch.FloatTensor(sol_pred)
+                            # the objective returned by some risk-averse models is the risk-adjusted objective, not the true objective
+                            # so compute it here
+                            obj_pred = torch.dot(prior.loc[i], sol_pred)
 
-                        sol_pred = torch.FloatTensor(sol_pred)
+                            sample_metrics = get_sample_val_metrics(
+                                data_model,
+                                costs[i],
+                                sols[i],
+                                objs[i],
+                                costs_pred[i],
+                                sol_pred,
+                                obj_pred,
+                                train_set.is_integer,
+                            )
 
-                        sample_metrics = get_sample_val_metrics(
-                            data_model,
-                            costs[i],
-                            sols[i],
-                            objs[i],
-                            costs_pred[i],
-                            sol_pred,
-                            obj_pred,
-                            train_set.is_integer,
-                        )
+                            for name, value in sample_metrics._asdict().items():
+                                name = "val/" + name
+                                if name not in metrics:
+                                    metrics[name] = Average()
+                                metrics[name].update(value)
 
-                        for name, value in sample_metrics._asdict().items():
-                            name = "val/" + name
-                            if name not in metrics:
-                                metrics[name] = Average()
-                            metrics[name].update(value)
-
-                    except:
-                        if "val/success" not in metrics:
-                            metrics["val/success"] = Average()
-                        metrics["val/success"].update(0.0)
+                        except:
+                            if "val/success" not in metrics:
+                                metrics["val/success"] = Average()
+                            metrics["val/success"].update(0.0)
 
         if args.use_wandb:
-            try:
-                log = {name: avg.compute() for name, avg in metrics.items()}
-                log["train/pyepo_regret_norm"] = log["train/spo_loss"] / (log["train/obj_true"] + 1e-7)
-                log["val/pyepo_regret_norm"] = log["val/spo_loss"] / (log["val/obj_true"] + 1e-7)
-                wandb.log(log, step=epoch)
+            log = {}
+            for name, avg in metrics.items():
+                try:
+                    log[name] = avg.compute()
+                except NotComputableError as e:
+                    pass
 
-            except:
-                pass
+            if "train/spo_loss" in log and "train/obj_true" in log:
+                log["train/pyepo_regret_norm"] = log["train/spo_loss"] / (log["train/obj_true"] + 1e-7)
+            if "val/spo_loss" in log and "val/obj_true" in log:
+                log["val/pyepo_regret_norm"] = log["val/spo_loss"] / (log["val/obj_true"] + 1e-7)
+            wandb.log(log, step=epoch)
 
         for avg in metrics.values():
             avg.reset()
