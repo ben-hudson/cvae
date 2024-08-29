@@ -87,12 +87,24 @@ class ChanceConstrainedShortestPath(BinaryShortestPath):
 
 
 class CVaRShortestPath(BinaryShortestPath):
-    def __init__(self, grid: Tuple[int], costs_mean: torch.Tensor, costs_std: torch.Tensor, alpha: float):
+    def __init__(
+        self, grid: Tuple[int], costs_mean: torch.Tensor, costs_std: torch.Tensor, alpha: float, tail: str = "right"
+    ):
         self.costs_mean = torch.FloatTensor(costs_mean)
         self.costs_std = torch.FloatTensor(costs_std)
 
+        # right tail CVaR_a = left tail CVaR_{1-a}
+        # we flip alpha accordingly and calculate the right tail CVaR
+        if tail == "right":
+            self.beta = torch.tensor(alpha)
+        elif tail == "left":
+            self.beta = torch.tensor(1 - alpha)
+        else:
+            raise ValueError(f"tail must be 'left' or 'right'")
+
         standard_normal = torch.distributions.Normal(0, 1)
-        self.risk_tol = standard_normal.log_prob(standard_normal.icdf(torch.tensor(alpha))).exp() / (1 - alpha)
+        quantile = standard_normal.icdf(self.beta)
+        self.prob_quantile = standard_normal.log_prob(quantile).exp()
 
         super().__init__(grid)
 
@@ -106,7 +118,7 @@ class CVaRShortestPath(BinaryShortestPath):
         # so, t^2 >= x^T * cov * x
         # cov is diagonal so x^T * cov * x = x * cov_ii * x = std^2 * x^2
         m.addConstr(obj_std**2 >= gp.quicksum((self.costs_std[i] ** 2) * (x[k] ** 2) for i, k in enumerate(x)))
-        m.setObjective(obj + self.risk_tol * obj_std)
+        m.setObjective(obj + obj_std * self.prob_quantile / (1 - self.beta))
 
         return m, x
 
@@ -120,7 +132,7 @@ class VaRShortestPath(BinaryShortestPath):
         self.costs_std = torch.FloatTensor(costs_std)
 
         standard_normal = torch.distributions.Normal(0, 1)
-        self.risk_tol = standard_normal.icdf(torch.tensor(alpha))
+        self.quantile = standard_normal.icdf(torch.tensor(alpha))
 
         super().__init__(grid)
 
@@ -134,7 +146,7 @@ class VaRShortestPath(BinaryShortestPath):
         # so, t^2 >= x^T * cov * x
         # cov is diagonal so x^T * cov * x = x * cov_ii * x = std^2 * x^2
         m.addConstr(obj_std**2 >= gp.quicksum((self.costs_std[i] ** 2) * (x[k] ** 2) for i, k in enumerate(x)))
-        m.setObjective(obj + self.risk_tol * obj_std)
+        m.setObjective(obj + self.quantile * obj_std)
 
         return m, x
 
