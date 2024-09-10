@@ -5,9 +5,10 @@ import pyepo.metric
 import torch
 import tqdm
 
+from collections import defaultdict
 from ignite.metrics import Average
-from utils import get_sample_val_metrics, get_wandb_name
 from models.risk_averse import CVaRShortestPath
+from utils import get_sample_val_metrics, get_wandb_name
 
 
 def get_argparser():
@@ -71,27 +72,34 @@ if __name__ == "__main__":
     if args.dataset == "shortestpath":
         is_integer = True
         grid = (5, 5)
-        data_model = pyepo.model.grb.shortestPathModel(grid)
-        feats, expected_costs = pyepo.data.shortestpath.genData(
+        feats, costs_expected = pyepo.data.shortestpath.genData(
             args.n_samples, args.n_features, grid, deg=args.degree, noise_width=0, seed=args.seed
         )
-        expected_costs = torch.FloatTensor(expected_costs)
-        noise_halfwidths = expected_costs.abs() * args.noise_width
+
+        feats = torch.FloatTensor(feats)
+        costs_expected = torch.FloatTensor(costs_expected)
+
         # the way PyEPO generates noise means the lowest cost path is also the most risk-averse path
         # we shuffle which noise distribution corresponds to which cost so this is not true
+        noise_halfwidths = costs_expected.abs() * args.noise_width
         noise_halfwidths = noise_halfwidths[:, torch.randperm(noise_halfwidths.size(-1))]
-        noise = torch.distributions.Uniform(-noise_halfwidths, noise_halfwidths).sample()
-        costs = expected_costs + noise
+
+        cost_dist = "uniform"
+        cost_dist_los = costs_expected - noise_halfwidths
+        cost_dist_his = costs_expected + noise_halfwidths
+        costs = torch.distributions.Uniform(cost_dist_los, cost_dist_his).sample()
+
+        data_model = pyepo.model.grb.shortestPathModel(grid)
 
     else:
-        raise ValueError("NYI")
+        raise ValueError(f"unknown dataset {args.dataset}")
 
     costs_std = noise_halfwidths / np.sqrt(3)
 
     cost_marginal_mean = costs.mean(dim=0)
     cost_marginal_std = costs.std(dim=0, correction=0)
 
-    metrics = {}
+    metrics = defaultdict(Average)
 
     # we want to report the running average every so often
     # so we divide the total number of samples into "batches"
@@ -103,6 +111,11 @@ if __name__ == "__main__":
     for i in tqdm.trange(args.n_samples):
         cost_true = costs[i]
 
+        if cost_dist == "uniform":
+            cost_dist_true = torch.distributions.Uniform(cost_dist_los[i], cost_dist_his[i])
+        else:
+            raise ValueError(f"unknown distribution {cost_dist}")
+
         data_model.setObj(cost_true)
         sol_true, obj_true = data_model.solve()
         sol_true = torch.FloatTensor(sol_true)
@@ -110,20 +123,22 @@ if __name__ == "__main__":
         objs_true.append(obj_true)
 
         if args.baseline == "ra_oracle":
-            cost_pred = expected_costs[i]
+            cost_pred = costs_expected[i]
             cost_pred_std = costs_std[i]
             ra_data_model = CVaRShortestPath(grid, cost_pred, cost_pred_std, 0.90, tail="right")
             sol_pred, _ = ra_data_model.solve()
 
         else:
             if args.baseline == "oracle":
-                cost_pred = expected_costs[i]
+                cost_pred = costs_expected[i]
             elif args.baseline == "random":
                 cost_pred = cost_marginal_mean + cost_marginal_std * torch.randn_like(cost_true)
             elif args.baseline == "mean":
                 cost_pred = cost_marginal_mean
             else:
                 raise ValueError(f"unknown baseline {args.model}")
+
+            cost_dist_pred = torch.distributions.Normal(costs_expected[i], costs_std[i])
 
             data_model.setObj(cost_pred)
             sol_pred, _ = data_model.solve()
@@ -132,14 +147,21 @@ if __name__ == "__main__":
         obj_pred = torch.dot(cost_pred, sol_pred)
 
         sample_metrics = get_sample_val_metrics(
-            data_model, cost_true, sol_true, obj_true, cost_pred, sol_pred, obj_pred, is_integer
+            data_model,
+            cost_true,
+            sol_true,
+            obj_true,
+            cost_pred,
+            sol_pred,
+            obj_pred,
+            cost_dist_true,
+            cost_dist_pred,
+            is_integer,
         )
 
         for name, value in sample_metrics._asdict().items():
-            name = "val/" + name
-            if name not in metrics:
-                metrics[name] = Average()
-            metrics[name].update(value)
+            if not np.isinf(value):
+                metrics["val/" + name].update(value)
 
         if i % batch_size == 0:
             report_metrics(metrics, i // batch_size, args.use_wandb)

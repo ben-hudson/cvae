@@ -2,16 +2,18 @@ import argparse
 import pyepo
 import pyepo.metric
 import torch
+import torch.distributions as D
+import torch.nn.functional as F
 import tqdm
 
-from ignite.metrics import Average
-from ignite.exceptions import NotComputableError
-from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader
-
+from collections import defaultdict
 from data.pyepo import PyEPODataset
+from ignite.exceptions import NotComputableError
+from ignite.metrics import Average
 from models.risk_averse import CVaRShortestPath
 from models.solver_vae import SolverVAE
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader
 from utils import get_sample_val_metrics, get_wandb_name
 
 
@@ -84,13 +86,19 @@ if __name__ == "__main__":
             args.n_samples, args.n_features, grid, deg=args.degree, noise_width=0, seed=args.seed
         )
 
+        feats = torch.FloatTensor(feats)
         costs_expected = torch.FloatTensor(costs_expected)
-        noise_halfwidths = costs_expected.abs() * args.noise_width
+
         # the way PyEPO generates noise means the lowest cost path is also the most risk-averse path
         # we shuffle which noise distribution corresponds to which cost so this is not true
+        noise_halfwidths = costs_expected.abs() * args.noise_width
         noise_halfwidths = noise_halfwidths[:, torch.randperm(noise_halfwidths.size(-1))]
-        noise = torch.distributions.Uniform(-noise_halfwidths, noise_halfwidths).sample()
-        costs = costs_expected + noise
+
+        cost_dist = "uniform"
+        cost_dist_los = costs_expected - noise_halfwidths
+        cost_dist_his = costs_expected + noise_halfwidths
+        cost_dist_params = torch.cat([cost_dist_los, cost_dist_his], dim=-1)
+        costs = torch.distributions.Uniform(cost_dist_los, cost_dist_his).sample()
 
         data_model = pyepo.model.grb.shortestPathModel(grid)
 
@@ -99,49 +107,51 @@ if __name__ == "__main__":
 
     indices = torch.randperm(len(costs))
     train_indices, test_indices = train_test_split(indices, test_size=1000)
-    train_set = PyEPODataset(data_model, feats[train_indices], costs[train_indices], norm=True)
-    test_set = PyEPODataset(data_model, feats[test_indices], costs[test_indices], norm=False)
+    train_set = PyEPODataset(data_model, feats[train_indices], costs[train_indices], cost_dist_params[train_indices])
+    test_set = PyEPODataset(data_model, feats[test_indices], costs[test_indices], cost_dist_params[test_indices])
 
     train_bs, test_bs = min(args.batch_size, len(train_set)), min(args.batch_size, len(test_set))
     train_loader = DataLoader(train_set, batch_size=train_bs, shuffle=True, num_workers=args.workers, drop_last=True)
     test_loader = DataLoader(test_set, batch_size=test_bs, shuffle=False, num_workers=args.workers, drop_last=True)
 
-    feats, costs, sols, objs = train_set[0]
+    feats, costs, sols, objs, cost_dist_params = train_set[0]
     model = SolverVAE(feats.size(-1), sols.size(-1), costs.size(-1), args.mlp_hidden_dim, args.mlp_hidden_layers)
     model.to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    spo_loss = pyepo.func.SPOPlus(data_model, processes=args.workers)
+    imle_loss = pyepo.func.implicitMLE(data_model, processes=args.workers, n_samples=10, two_sides=True)
 
     # these get populated automatically
-    metrics = {}
+    metrics = defaultdict(Average)
 
     progress_bar = tqdm.trange(args.max_epochs)
     for epoch in progress_bar:
-        for batch_normed in train_loader:
+        for batch in train_loader:
             model.train()
             optimizer.zero_grad()
 
-            feats_normed, costs_normed, sols_normed, objs_normed = batch_normed
-            feats_normed = feats_normed.to(device)
-            costs_normed = costs_normed.to(device)
-            sols_normed = sols_normed.to(device)
-            objs_normed = objs_normed.to(device)
+            feats, costs, sols, objs, cost_dist_params = batch
+            feats = feats.to(device)
+            costs = costs.to(device)
+            sols = sols.to(device)
+            objs = objs.to(device)
+            cost_dist_params = cost_dist_params.to(device)
 
-            feats, costs, sols, objs = train_set.unnorm(feats_normed, costs_normed, sols_normed, objs_normed)
+            feats_normed, costs_normed, sols_normed, _, _ = train_set.norm(feats=feats, costs=costs, sols=sols)
 
             kld, costs_pred_normed = model(feats_normed, sols_normed)
 
-            _, costs_pred, _, _ = train_set.unnorm(costs_normed=costs_pred_normed)
+            _, costs_pred, _, _, _ = train_set.unnorm(costs=costs_pred_normed)
 
-            spo = spo_loss(costs_pred, costs, sols, objs)
-            loss = args.kld_weight * kld + (1 - args.kld_weight) * spo
+            sols_pred = imle_loss(costs_pred)
+            bce = F.binary_cross_entropy(sols_pred, sols, reduction="mean")
+            loss = args.kld_weight * kld + (1 - args.kld_weight) * bce
 
             train_metrics = {
                 "kld": kld.detach(),
                 "loss": loss.detach(),
                 "obj_true": objs.detach().abs().mean(),
-                "spo_loss": spo.detach().mean(),
+                "bce": bce.detach(),
             }
 
             loss.backward()
@@ -157,37 +167,47 @@ if __name__ == "__main__":
             model.eval()
             with torch.no_grad():
                 for batch in test_loader:
-                    feats, costs, sols, objs = batch
-                    feats_normed, costs_normed, sols_normed, objs_normed = train_set.norm(*batch)
+                    feats, costs, sols, objs, cost_dist_params = batch
+                    feats_normed, costs_normed, _, _, _ = train_set.norm(feats=feats, costs=costs)
 
                     prior_normed = model.sample(feats_normed.to(device))
-                    _, costs_pred, _, _ = train_set.unnorm(costs_normed=prior_normed.loc.cpu())
+                    _, costs_pred, _, _, _ = train_set.unnorm(costs=prior_normed.loc.cpu())
                     # we have to unnorm the std as well, which is just scale*std
                     # from https://en.wikipedia.org/wiki/Normal_distribution#Operations_and_functions_of_normal_variables
                     costs_pred_std = prior_normed.scale.cpu() * train_set.scales.costs
-                    prior = torch.distributions.Normal(costs_pred, costs_pred_std)
 
                     # solve the problems explicitly
                     for i in range(len(costs)):
                         try:
                             if args.risk_level == 0.5:
                                 # if the decision-making is risk-neutral just use the normal model
-                                data_model.setObj(prior.loc[i])
+                                data_model.setObj(costs_pred[i])
                                 sol_pred, _ = data_model.solve()
 
                             else:
                                 if args.dataset == "shortestpath":
                                     ra_data_model = CVaRShortestPath(
-                                        grid, prior.loc[i], prior.scale[i], args.risk_level, tail="right"
+                                        grid,
+                                        costs_pred[i],
+                                        costs_pred_std[i],
+                                        args.risk_level,
+                                        tail="right",
                                     )
                                     sol_pred, _ = ra_data_model.solve()
                                 else:
                                     raise ValueError(f"unknown dataset {args.dataset}")
 
-                            sol_pred = torch.FloatTensor(sol_pred)
-                            # the objective returned by some risk-averse models is the risk-adjusted objective, not the true objective
-                            # so compute it here
-                            obj_pred = torch.dot(prior.loc[i], sol_pred)
+                            sol_pred = (torch.FloatTensor(sol_pred) > 0.5).to(torch.float32)
+                            # the objective returned by some risk-averse models is the risk objective (e.g.)
+                            # so compute the true objective here
+                            obj_pred = torch.dot(costs_pred[i], sol_pred)
+
+                            if cost_dist == "uniform":
+                                cost_dist_lo, cost_dist_hi = cost_dist_params[i].chunk(2, dim=-1)
+                                prior = D.Uniform(cost_dist_lo, cost_dist_hi)
+                            else:
+                                raise ValueError(f"unknown distribution {cost_dist}")
+                            prior_pred = D.Normal(costs_pred[i], costs_pred_std[i])
 
                             sample_metrics = get_sample_val_metrics(
                                 data_model,
@@ -197,18 +217,15 @@ if __name__ == "__main__":
                                 costs_pred[i],
                                 sol_pred,
                                 obj_pred,
+                                prior,
+                                prior_pred,
                                 train_set.is_integer,
                             )
 
                             for name, value in sample_metrics._asdict().items():
-                                name = "val/" + name
-                                if name not in metrics:
-                                    metrics[name] = Average()
-                                metrics[name].update(value)
+                                metrics["val/" + name].update(value)
 
                         except:
-                            if "val/success" not in metrics:
-                                metrics["val/success"] = Average()
                             metrics["val/success"].update(0.0)
 
         if args.use_wandb:

@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=4G
-#SBATCH --time=03:00:00
+#SBATCH --time=08:00:00
 #SBATCH --output /network/scratch/b/ben.hudson/slurm/%j.out
 #SBATCH --error /network/scratch/b/ben.hudson/slurm/%j.err
 
@@ -23,4 +23,4 @@ fi
 DATASET=${1}
 EXTRA_ARGS=${@:2}
 
-python scripts/solver_vae_experiment.py $DATASET --wandb_project pyepo --workers 4 $EXTRA_ARGS
+python scripts/solver_vae_experiment.py $DATASET --wandb_project pyepo --workers 8 $EXTRA_ARGS
