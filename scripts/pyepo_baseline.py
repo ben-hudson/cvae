@@ -8,7 +8,7 @@ import tqdm
 from collections import defaultdict
 from ignite.metrics import Average
 from models.risk_averse import CVaRShortestPath
-from utils import get_sample_val_metrics, get_wandb_name
+from utils import get_sample_val_metrics, get_wandb_name, WandBHistogram
 
 
 def get_argparser():
@@ -39,14 +39,16 @@ def get_argparser():
 
 def report_metrics(metrics: dict, step: int, use_wandb: bool):
     log = {name: avg.compute() for name, avg in metrics.items()}
-    log["val/pyepo_regret_norm"] = log["val/spo_loss"] / (log["val/obj_true"] + 1e-7)
 
     if use_wandb:
         wandb.log(log, step=step)
     else:
         print(f"step: {step}")
         for name, val in log.items():
-            print(f"{name}: {val:.4f}")
+            try:
+                print(f"{name}: {val:.4f}")
+            except Exception as e:
+                print(f"{name}: {e}")
 
 
 if __name__ == "__main__":
@@ -79,27 +81,23 @@ if __name__ == "__main__":
         feats = torch.FloatTensor(feats)
         costs_expected = torch.FloatTensor(costs_expected)
 
-        # the way PyEPO generates noise means the lowest cost path is also the most risk-averse path
-        # we shuffle which noise distribution corresponds to which cost so this is not true
-        noise_halfwidths = costs_expected.abs() * args.noise_width
-        noise_halfwidths = noise_halfwidths[:, torch.randperm(noise_halfwidths.size(-1))]
+        costs_std = args.noise_width / costs_expected.abs()
 
-        cost_dist = "uniform"
-        cost_dist_los = costs_expected - noise_halfwidths
-        cost_dist_his = costs_expected + noise_halfwidths
-        costs = torch.distributions.Uniform(cost_dist_los, cost_dist_his).sample()
+        cost_dist = "normal"
+        costs = torch.distributions.Normal(costs_expected, costs_std).sample()
 
         data_model = pyepo.model.grb.shortestPathModel(grid)
 
     else:
         raise ValueError(f"unknown dataset {args.dataset}")
 
-    costs_std = noise_halfwidths / np.sqrt(3)
-
     cost_marginal_mean = costs.mean(dim=0)
     cost_marginal_std = costs.std(dim=0, correction=0)
 
     metrics = defaultdict(Average)
+    # override these two
+    metrics["val/obj_true"] = WandBHistogram()
+    metrics["val/obj_realized"] = WandBHistogram()
 
     # we want to report the running average every so often
     # so we divide the total number of samples into "batches"
@@ -113,6 +111,8 @@ if __name__ == "__main__":
 
         if cost_dist == "uniform":
             cost_dist_true = torch.distributions.Uniform(cost_dist_los[i], cost_dist_his[i])
+        elif cost_dist == "normal":
+            cost_dist_true = torch.distributions.Normal(costs_expected[i], costs_std[i])
         else:
             raise ValueError(f"unknown distribution {cost_dist}")
 
@@ -125,7 +125,7 @@ if __name__ == "__main__":
         if args.baseline == "ra_oracle":
             cost_pred = costs_expected[i]
             cost_pred_std = costs_std[i]
-            ra_data_model = CVaRShortestPath(grid, cost_pred, cost_pred_std, 0.90, tail="right")
+            ra_data_model = CVaRShortestPath(grid, cost_pred, cost_pred_std, 0.99, tail="right")
             sol_pred, _ = ra_data_model.solve()
 
         else:
@@ -138,10 +138,10 @@ if __name__ == "__main__":
             else:
                 raise ValueError(f"unknown baseline {args.model}")
 
-            cost_dist_pred = torch.distributions.Normal(costs_expected[i], costs_std[i])
-
             data_model.setObj(cost_pred)
             sol_pred, _ = data_model.solve()
+
+        cost_dist_pred = torch.distributions.Normal(costs_expected[i], costs_std[i])
 
         sol_pred = (torch.FloatTensor(sol_pred) > 0.5).to(torch.float32)
         obj_pred = torch.dot(cost_pred, sol_pred)
@@ -151,10 +151,10 @@ if __name__ == "__main__":
             cost_true,
             sol_true,
             obj_true,
+            cost_dist_true,
             cost_pred,
             sol_pred,
             obj_pred,
-            cost_dist_true,
             cost_dist_pred,
             is_integer,
         )

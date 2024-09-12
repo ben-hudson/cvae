@@ -6,7 +6,7 @@ import torch.distributions as D
 
 from collections import namedtuple
 
-ValMetrics = namedtuple("ValMetrics", "cost_err decision_err regret spo_loss obj_true obj_realized success kld")
+ValMetrics = namedtuple("ValMetrics", "cost_err decision_err regret disappointment surprise obj_true obj_realized kld")
 
 
 def get_sample_val_metrics(
@@ -14,20 +14,24 @@ def get_sample_val_metrics(
     cost_true: torch.Tensor,
     sol_true: torch.Tensor,
     obj_true: float,
+    cost_dist_true: D.Distribution,
     cost_pred: torch.Tensor,
     sol_pred: torch.Tensor,
     obj_pred: float,
-    cost_dist_true: D.Distribution,
     cost_dist_pred: D.Distribution,
     is_integer: bool = False,
 ):
-    obj_realized = torch.dot(cost_true, sol_pred).item()
+    obj_realized = torch.dot(cost_true, sol_pred)
 
-    spo_loss = obj_realized - obj_true
-    regret = obj_realized - obj_pred
+    regret = obj_realized - obj_true
+    # disappointment is positive when the realized objective is greater than the predicted one
+    disappointment = (obj_realized - obj_pred).clamp(min=0)
+    # surprise is positive when the realized objective is less than the predicted one (the predicted one is greater)
+    surprise = (obj_pred - obj_realized).clamp(min=0)
+    # these definitions flip when maximizing
     if data_model.modelSense == pyepo.EPO.MAXIMIZE:
-        spo_loss *= -1
         regret *= -1
+        disappointment, surprise = surprise, disappointment
 
     cost_err = F.mse_loss(cost_pred, cost_true, reduction="mean").item()
     if is_integer:
@@ -41,9 +45,9 @@ def get_sample_val_metrics(
         cost_err,
         decision_err,
         regret,
-        spo_loss,
+        disappointment,
+        surprise,
         abs(obj_true),
         abs(obj_realized),
-        1.0,
         kld,
     )

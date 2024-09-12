@@ -89,16 +89,11 @@ if __name__ == "__main__":
         feats = torch.FloatTensor(feats)
         costs_expected = torch.FloatTensor(costs_expected)
 
-        # the way PyEPO generates noise means the lowest cost path is also the most risk-averse path
-        # we shuffle which noise distribution corresponds to which cost so this is not true
-        noise_halfwidths = costs_expected.abs() * args.noise_width
-        noise_halfwidths = noise_halfwidths[:, torch.randperm(noise_halfwidths.size(-1))]
+        costs_std = args.noise_width / costs_expected.abs()
 
-        cost_dist = "uniform"
-        cost_dist_los = costs_expected - noise_halfwidths
-        cost_dist_his = costs_expected + noise_halfwidths
-        cost_dist_params = torch.cat([cost_dist_los, cost_dist_his], dim=-1)
-        costs = torch.distributions.Uniform(cost_dist_los, cost_dist_his).sample()
+        cost_dist = "normal"
+        cost_dist_params = torch.cat([costs_expected, costs_std], dim=-1)
+        costs = torch.distributions.Normal(costs_expected, costs_std).sample()
 
         data_model = pyepo.model.grb.shortestPathModel(grid)
 
@@ -172,7 +167,7 @@ if __name__ == "__main__":
 
                     prior_normed = model.sample(feats_normed.to(device))
                     _, costs_pred, _, _, _ = train_set.unnorm(costs=prior_normed.loc.cpu())
-                    # we have to unnorm the std as well, which is just scale*std
+                    # we have to unnorm the distribution scale as well, which is just multiplying it by the cost scaling factor
                     # from https://en.wikipedia.org/wiki/Normal_distribution#Operations_and_functions_of_normal_variables
                     costs_pred_std = prior_normed.scale.cpu() * train_set.scales.costs
 
@@ -205,6 +200,9 @@ if __name__ == "__main__":
                             if cost_dist == "uniform":
                                 cost_dist_lo, cost_dist_hi = cost_dist_params[i].chunk(2, dim=-1)
                                 prior = D.Uniform(cost_dist_lo, cost_dist_hi)
+                            elif cost_dist == "normal":
+                                cost_dist_loc, cost_dist_scale = cost_dist_params[i].chunk(2, dim=-1)
+                                prior = D.Normal(cost_dist_loc, cost_dist_scale)
                             else:
                                 raise ValueError(f"unknown distribution {cost_dist}")
                             prior_pred = D.Normal(costs_pred[i], costs_pred_std[i])
@@ -214,10 +212,10 @@ if __name__ == "__main__":
                                 costs[i],
                                 sols[i],
                                 objs[i],
+                                prior,
                                 costs_pred[i],
                                 sol_pred,
                                 obj_pred,
-                                prior,
                                 prior_pred,
                                 train_set.is_integer,
                             )
@@ -225,7 +223,9 @@ if __name__ == "__main__":
                             for name, value in sample_metrics._asdict().items():
                                 metrics["val/" + name].update(value)
 
-                        except:
+                            metrics["val/success"].update(1.0)
+
+                        except Exception as e:
                             metrics["val/success"].update(0.0)
 
         if args.use_wandb:
@@ -236,10 +236,6 @@ if __name__ == "__main__":
                 except NotComputableError as e:
                     pass
 
-            if "train/spo_loss" in log and "train/obj_true" in log:
-                log["train/pyepo_regret_norm"] = log["train/spo_loss"] / (log["train/obj_true"] + 1e-7)
-            if "val/spo_loss" in log and "val/obj_true" in log:
-                log["val/pyepo_regret_norm"] = log["val/spo_loss"] / (log["val/obj_true"] + 1e-7)
             wandb.log(log, step=epoch)
 
         for avg in metrics.values():
