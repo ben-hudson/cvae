@@ -15,7 +15,7 @@ class SolverVAE(nn.Module):
         mlp_hidden_dim: int,
         mlp_hidden_layers: int,
     ) -> None:
-        super(SolverVAE, self).__init__()
+        super().__init__()
 
         self.feat_dim = feat_dim
         self.decision_dim = decision_dim
@@ -54,12 +54,7 @@ class SolverVAE(nn.Module):
         prior = self._get_normal(prior_mean, prior_logvar)
         posterior = self._get_normal(posterior_mean, posterior_logvar)
 
-        costs_pred = posterior.rsample()
-
-        # the torch kl_divergence function actually calculates the NEGATIVE KLD
-        kld = kl_divergence(posterior, prior).mean()
-
-        return kld, costs_pred
+        return prior, posterior
 
     def sample(self, context: torch.Tensor):
         prior_mean, prior_logvar = self.prior_net(context).chunk(self.params_per_cost, dim=-1)

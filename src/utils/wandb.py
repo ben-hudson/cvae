@@ -2,7 +2,6 @@ import argparse
 import torch
 import wandb
 
-from collections.abc import Sequence
 from ignite.exceptions import NotComputableError
 from ignite.metrics import Metric
 
@@ -29,13 +28,15 @@ class WandBHistogram(Metric):
     def reset(self):
         self.samples = []
 
-    def update(self, sample):
-        if isinstance(sample, Sequence):
-            raise TypeError("received a sequence but expected a single value")
-        self.samples.append(sample)
+    def update(self, samples):
+        self.samples.append(samples.cpu())
 
     def compute(self):
         if len(self.samples) == 0:
             raise NotComputableError("no samples")
 
-        return wandb.Histogram(self.samples)
+        if isinstance(self.samples[0], torch.Tensor):
+            samples = torch.cat(self.samples, dim=-1)
+        else:
+            samples = self.samples
+        return wandb.Histogram(samples)

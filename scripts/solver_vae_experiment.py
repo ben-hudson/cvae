@@ -1,6 +1,8 @@
 import argparse
 import pyepo
+import pyepo.data
 import pyepo.metric
+import pyepo.model
 import torch
 import torch.distributions as D
 import torch.nn.functional as F
@@ -10,11 +12,13 @@ from collections import defaultdict
 from data.pyepo import PyEPODataset
 from ignite.exceptions import NotComputableError
 from ignite.metrics import Average
-from models.risk_averse import CVaRShortestPath
+from models.risk_averse import VaRShortestPath, CVaRShortestPath
 from models.solver_vae import SolverVAE
+from models.parallel_solver import ParallelSolver
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
-from utils import get_sample_val_metrics, get_wandb_name
+from typing import Sequence, Dict, Tuple
+from utils import get_val_metrics, get_wandb_name, WandBHistogram
 
 
 def get_argparser():
@@ -60,6 +64,96 @@ def get_argparser():
     model_args.add_argument("--wandb_tags", type=str, nargs="+", default=[], help="WandB tags")
 
     return parser
+
+
+def get_train_metrics(
+    prior: D.Distribution,
+    posterior: D.Distribution,
+    sols: torch.Tensor,
+    sols_pred: torch.Tensor,
+    class_weights: Sequence,
+    kld_weight: float,
+):
+    # the torch kl_divergence function actually calculates the NEGATIVE KLD
+    kld = D.kl_divergence(posterior, prior).mean()
+
+    sample_weights = torch.empty_like(sols)
+    sample_weights[sols == 0] = class_weights[0]
+    sample_weights[sols == 1] = class_weights[1]
+    bce = F.binary_cross_entropy(sols_pred, sols, weight=sample_weights, reduction="mean")
+
+    loss = kld_weight * kld + (1 - kld_weight) * bce
+
+    metrics = {
+        "kld": kld.detach(),
+        "bce": bce.detach(),
+        "loss": loss.detach(),
+    }
+
+    return loss, metrics
+
+
+def train_step(model, solver, batch, device, train_set, kld_weight):
+    batch_normed = train_set.norm(**batch._asdict())
+
+    feats, costs, sols, _, _ = batch_normed
+    feats = feats.to(device)
+    costs = costs.to(device)
+    sols = sols.to(device)
+
+    prior, posterior = model(feats, sols)
+
+    # when we are training, we are imitating the wait-and-see decision-making process, which is risk neutral
+    # so we need to use the reparametrization trick
+    y_pred = posterior.rsample()
+    sols_pred = solver(y_pred)
+
+    loss, train_metrics = get_train_metrics(prior, posterior, sols, sols_pred, train_set.class_weights, kld_weight)
+
+    return loss, train_metrics
+
+
+def eval_step(model, solver, batch, device, train_set, risk_level):
+    feats, costs, sols, objs, cost_dist_params = batch
+    feats = feats.to(device)
+    costs = costs.to(device)
+    sols = sols.to(device)
+    objs = objs.to(device)
+    cost_dist_mean, cost_dist_std = cost_dist_params.to(device).chunk(2, dim=-1)
+    cost_dist = D.Normal(cost_dist_mean, cost_dist_std)
+
+    feats_normed, _, _, _, _ = train_set.norm(feats=feats)
+
+    prior = model.sample(feats_normed.to(device))
+
+    if risk_level == 0.5:
+        # we use the expectation for the risk neutral model
+        y_pred = prior.loc
+    else:
+        # we use all parameters of the prior for the risk averse model
+        y_pred = torch.cat([prior.loc, prior.scale], dim=-1)
+
+    sols_pred = solver(y_pred)
+
+    # in both cases, the objective is calculated with the expectation
+    _, costs_pred, _, _, _ = train_set.unnorm(costs=prior.loc)
+    objs_pred = torch.bmm(costs_pred.unsqueeze(1), sols_pred.unsqueeze(2)).squeeze(2)
+
+    eval_metrics = get_val_metrics(
+        costs,
+        sols,
+        objs,
+        cost_dist,
+        costs_pred,
+        sols_pred,
+        objs_pred,
+        prior,
+        data_model.modelSense,
+        train_set.is_integer,
+        train_set.class_weights,
+    )
+
+    return eval_metrics
 
 
 if __name__ == "__main__":
@@ -114,10 +208,18 @@ if __name__ == "__main__":
     model.to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    imle_loss = pyepo.func.implicitMLE(data_model, processes=args.workers, n_samples=10, two_sides=True)
 
-    # these get populated automatically
+    imle = pyepo.func.implicitMLE(
+        data_model, processes=args.workers, n_samples=10, solve_ratio=1.0, dataset=train_set, two_sides=True
+    )
+    if args.risk_level == 0.5:
+        parallel_solver = ParallelSolver(1, pyepo.model.grb.shortestPathModel, grid)
+    else:
+        parallel_solver = ParallelSolver(1, CVaRShortestPath, grid, args.risk_level, tail="right")
+
     metrics = defaultdict(Average)
+    metrics["val/obj_true"] = WandBHistogram()
+    metrics["val/obj_realized"] = WandBHistogram()
 
     progress_bar = tqdm.trange(args.max_epochs)
     for epoch in progress_bar:
@@ -125,118 +227,34 @@ if __name__ == "__main__":
             model.train()
             optimizer.zero_grad()
 
-            feats, costs, sols, objs, cost_dist_params = batch
-            feats = feats.to(device)
-            costs = costs.to(device)
-            sols = sols.to(device)
-            objs = objs.to(device)
-            cost_dist_params = cost_dist_params.to(device)
-
-            feats_normed, costs_normed, sols_normed, _, _ = train_set.norm(feats=feats, costs=costs, sols=sols)
-
-            kld, costs_pred_normed = model(feats_normed, sols_normed)
-
-            _, costs_pred, _, _, _ = train_set.unnorm(costs=costs_pred_normed)
-
-            sols_pred = imle_loss(costs_pred)
-            bce = F.binary_cross_entropy(sols_pred, sols, reduction="mean")
-            loss = args.kld_weight * kld + (1 - args.kld_weight) * bce
-
-            train_metrics = {
-                "kld": kld.detach(),
-                "loss": loss.detach(),
-                "obj_true": objs.detach().abs().mean(),
-                "bce": bce.detach(),
-            }
+            loss, train_metrics = train_step(model, imle, batch, device, train_set, args.kld_weight)
 
             loss.backward()
             optimizer.step()
 
             for name, value in train_metrics.items():
-                name = "train/" + name
-                if name not in metrics:
-                    metrics[name] = Average()
-                metrics[name].update(value)
+                metrics["train/" + name].update(value)
 
         if epoch % args.eval_every == 0:
             model.eval()
             with torch.no_grad():
                 for batch in test_loader:
-                    feats, costs, sols, objs, cost_dist_params = batch
-                    feats_normed, costs_normed, _, _, _ = train_set.norm(feats=feats, costs=costs)
+                    eval_metrics = eval_step(model, parallel_solver, batch, device, train_set, args.risk_level)
 
-                    prior_normed = model.sample(feats_normed.to(device))
-                    _, costs_pred, _, _, _ = train_set.unnorm(costs=prior_normed.loc.cpu())
-                    # we have to unnorm the distribution scale as well, which is just multiplying it by the cost scaling factor
-                    # from https://en.wikipedia.org/wiki/Normal_distribution#Operations_and_functions_of_normal_variables
-                    costs_pred_std = prior_normed.scale.cpu() * train_set.scales.costs
+                    for name, value in eval_metrics._asdict().items():
+                        metrics["val/" + name].update(value)
 
-                    # solve the problems explicitly
-                    for i in range(len(costs)):
-                        try:
-                            if args.risk_level == 0.5:
-                                # if the decision-making is risk-neutral just use the normal model
-                                data_model.setObj(costs_pred[i])
-                                sol_pred, _ = data_model.solve()
-
-                            else:
-                                if args.dataset == "shortestpath":
-                                    ra_data_model = CVaRShortestPath(
-                                        grid,
-                                        costs_pred[i],
-                                        costs_pred_std[i],
-                                        args.risk_level,
-                                        tail="right",
-                                    )
-                                    sol_pred, _ = ra_data_model.solve()
-                                else:
-                                    raise ValueError(f"unknown dataset {args.dataset}")
-
-                            sol_pred = (torch.FloatTensor(sol_pred) > 0.5).to(torch.float32)
-                            # the objective returned by some risk-averse models is the risk objective (e.g.)
-                            # so compute the true objective here
-                            obj_pred = torch.dot(costs_pred[i], sol_pred)
-
-                            if cost_dist == "uniform":
-                                cost_dist_lo, cost_dist_hi = cost_dist_params[i].chunk(2, dim=-1)
-                                prior = D.Uniform(cost_dist_lo, cost_dist_hi)
-                            elif cost_dist == "normal":
-                                cost_dist_loc, cost_dist_scale = cost_dist_params[i].chunk(2, dim=-1)
-                                prior = D.Normal(cost_dist_loc, cost_dist_scale)
-                            else:
-                                raise ValueError(f"unknown distribution {cost_dist}")
-                            prior_pred = D.Normal(costs_pred[i], costs_pred_std[i])
-
-                            sample_metrics = get_sample_val_metrics(
-                                data_model,
-                                costs[i],
-                                sols[i],
-                                objs[i],
-                                prior,
-                                costs_pred[i],
-                                sol_pred,
-                                obj_pred,
-                                prior_pred,
-                                train_set.is_integer,
-                            )
-
-                            for name, value in sample_metrics._asdict().items():
-                                metrics["val/" + name].update(value)
-
-                            metrics["val/success"].update(1.0)
-
-                        except Exception as e:
-                            metrics["val/success"].update(0.0)
+        to_log = {}
+        for name, avg in metrics.items():
+            try:
+                to_log[name] = avg.compute()
+            except NotComputableError as e:
+                pass
 
         if args.use_wandb:
-            log = {}
-            for name, avg in metrics.items():
-                try:
-                    log[name] = avg.compute()
-                except NotComputableError as e:
-                    pass
-
-            wandb.log(log, step=epoch)
+            wandb.log(to_log, step=epoch)
+        else:
+            progress_bar.set_postfix(to_log)
 
         for avg in metrics.values():
             avg.reset()

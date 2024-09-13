@@ -1,17 +1,17 @@
 import networkx as nx
 import numpy as np
-import pyepo
-import pyepo.data
-import pyepo.model
 import torch
+import pyepo
 
 from collections import namedtuple
 from matplotlib import pyplot as plt
+from pyepo.data.dataset import optDataset
+from sklearn.utils import compute_class_weight
 
-PyEPODatapoint = namedtuple("PyEPODatapoint", "feats costs sols objs cost_params")
+PyEPOData = namedtuple("PyEPOData", "feats costs sols objs cost_params")
 
 
-class PyEPODataset(pyepo.data.dataset.optDataset):
+class PyEPODataset(optDataset):
     def __init__(self, model, feats, costs, cost_params):
         super().__init__(model, feats, costs)
         # super sets self.feats and self.costs
@@ -21,7 +21,7 @@ class PyEPODataset(pyepo.data.dataset.optDataset):
 
         self.is_integer = ((self.sols == 0) | (self.sols == 1)).all()
 
-        self.means = PyEPODatapoint(
+        self.means = PyEPOData(
             self.feats.mean(dim=0, keepdim=True),
             self.costs.mean(dim=0, keepdim=True),
             self.sols.mean(dim=0, keepdim=True),
@@ -29,7 +29,7 @@ class PyEPODataset(pyepo.data.dataset.optDataset):
             self.cost_params.mean(dim=0, keepdim=True),
         )
 
-        self.scales = PyEPODatapoint(
+        self.scales = PyEPOData(
             self.feats.std(dim=0, correction=0, keepdim=True),
             self.costs.std(dim=0, correction=0, keepdim=True),
             self.sols.std(dim=0, correction=0, keepdim=True),
@@ -38,9 +38,13 @@ class PyEPODataset(pyepo.data.dataset.optDataset):
         )
 
         # if solutions are binary, we don't normalize them
+        # we do calculate class weights (there are always more 0s than 1s)
         if self.is_integer:
             self.means.sols[:] = 0.0
             self.scales.sols[:] = 1.0
+            self.class_weights = compute_class_weight(
+                class_weight="balanced", classes=np.array([0, 1]), y=self.sols.flatten().numpy()
+            )
 
         # prevent division by 0, just like sklearn.preprocessing.StandardScaler
         for scale in self.scales:
@@ -57,31 +61,31 @@ class PyEPODataset(pyepo.data.dataset.optDataset):
         scales = self.scales._asdict()
         normed_values = {}
 
-        for name in PyEPODatapoint._fields:
+        for name in PyEPOData._fields:
             if name in kwargs:
                 value = kwargs[name]
                 normed_values[name] = (value - means[name].to(value.device)) / scales[name].to(value.device)
             else:
                 normed_values[name] = None
 
-        return PyEPODatapoint(**normed_values)
+        return PyEPOData(**normed_values)
 
     def unnorm(self, **kwargs):
         means = self.means._asdict()
         scales = self.scales._asdict()
         unnormed_values = {}
 
-        for name in PyEPODatapoint._fields:
+        for name in PyEPOData._fields:
             if name in kwargs:
                 value = kwargs[name]
                 unnormed_values[name] = means[name].to(value.device) + scales[name].to(value.device) * value
             else:
                 unnormed_values[name] = None
 
-        return PyEPODatapoint(**unnormed_values)
+        return PyEPOData(**unnormed_values)
 
     def __getitem__(self, index):
-        return PyEPODatapoint(
+        return PyEPOData(
             self.feats[index], self.costs[index], self.sols[index], self.objs[index], self.cost_params[index]
         )
 

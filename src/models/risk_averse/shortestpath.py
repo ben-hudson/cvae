@@ -6,7 +6,7 @@ from gurobipy import GRB
 from typing import Tuple
 
 
-class BinaryShortestPath(pyepo.model.grb.shortestPathModel):
+class RiskAverseShortestPath(pyepo.model.grb.shortestPathModel):
     def _getModel(self):
         """
         A method to build Gurobi model
@@ -53,45 +53,8 @@ class BinaryShortestPath(pyepo.model.grb.shortestPathModel):
             raise e
 
 
-class ChanceConstrainedShortestPath(BinaryShortestPath):
-    def __init__(
-        self, grid: Tuple[int], costs_mean: torch.Tensor, costs_std: torch.Tensor, budget: float, alpha: float
-    ):
-        self.costs_mean = torch.FloatTensor(costs_mean)
-        self.costs_std = torch.FloatTensor(costs_std)
-        self.budget = budget  # maximum allowable distance
-
-        standard_normal = torch.distributions.Normal(0, 1)
-        self.risk_tol = standard_normal.icdf(torch.tensor(alpha))
-
-        super().__init__(grid)
-
-    def _getModel(self):
-        m, x = super()._getModel()
-
-        obj = gp.quicksum(self.costs_mean[i] * x[k] for i, k in enumerate(x))
-        m.setObjective(obj)
-
-        # chance constraint
-        # t is a dummy variable to track the upper bound on sqrt(x^T * cov * x)
-        obj_std = m.addVar(name="t")
-        # so, t^2 >= x^T * cov * x
-        # cov is diagonal so x^T * cov * x = x * cov_ii * x = std^2 * x^2
-        m.addConstr(obj_std**2 >= gp.quicksum((self.costs_std[i] ** 2) * (x[k] ** 2) for i, k in enumerate(x)))
-        m.addConstr(obj + self.risk_tol * obj_std <= self.budget)
-
-        return m, x
-
-    def setObj(self, c):
-        raise Exception("Setting objective isn't allowed because it changes the problem constraints")
-
-
-class CVaRShortestPath(BinaryShortestPath):
-    def __init__(
-        self, grid: Tuple[int], costs_mean: torch.Tensor, costs_std: torch.Tensor, alpha: float, tail: str = "right"
-    ):
-        self.costs_mean = torch.FloatTensor(costs_mean)
-        self.costs_std = torch.FloatTensor(costs_std)
+class CVaRShortestPath(RiskAverseShortestPath):
+    def __init__(self, grid: Tuple[int], alpha: float, tail: str = "right"):
 
         # right tail CVaR_a = left tail CVaR_{1-a}
         # we flip alpha accordingly and calculate the right tail CVaR
@@ -108,47 +71,40 @@ class CVaRShortestPath(BinaryShortestPath):
 
         super().__init__(grid)
 
-    def _getModel(self):
-        m, x = super()._getModel()
+    def setObj(self, cost_dist_params):
+        costs_mean, costs_std = cost_dist_params.chunk(2, dim=-1)
 
-        obj = gp.quicksum(self.costs_mean[i] * x[k] for i, k in enumerate(x))
+        m, x = self._getModel()  # get a fresh model
+        obj = gp.quicksum(costs_mean[i] * x[k] for i, k in enumerate(x))
 
-        # t is a dummy variable to track the upper bound on sqrt(x^T * cov * x)
-        obj_std = m.addVar(name="t")
-        # so, t^2 >= x^T * cov * x
+        # s is a dummy variable to track the upper bound on sqrt(x^T * cov * x)
+        obj_std = m.addVar(name="s")
+        # so, s^2 >= x^T * cov * x
         # cov is diagonal so x^T * cov * x = x * cov_ii * x = std^2 * x^2
-        m.addConstr(obj_std**2 >= gp.quicksum((self.costs_std[i] ** 2) * (x[k] ** 2) for i, k in enumerate(x)))
+        m.addConstr(obj_std**2 >= gp.quicksum((costs_std[i] ** 2) * (x[k] ** 2) for i, k in enumerate(x)))
         m.setObjective(obj + obj_std * self.prob_quantile / (1 - self.beta))
 
-        return m, x
-
-    def setObj(self, c):
-        raise Exception("Setting objective isn't allowed because it changes the problem constraints")
+        self._model, self.x = m, x
 
 
-class VaRShortestPath(BinaryShortestPath):
-    def __init__(self, grid: Tuple[int], costs_mean: torch.Tensor, costs_std: torch.Tensor, alpha: float):
-        self.costs_mean = torch.FloatTensor(costs_mean)
-        self.costs_std = torch.FloatTensor(costs_std)
-
+class VaRShortestPath(RiskAverseShortestPath):
+    def __init__(self, grid: Tuple[int], alpha: float):
         standard_normal = torch.distributions.Normal(0, 1)
         self.quantile = standard_normal.icdf(torch.tensor(alpha))
 
         super().__init__(grid)
 
-    def _getModel(self):
-        m, x = super()._getModel()
+    def setObj(self, cost_dist_params):
+        costs_mean, costs_std = cost_dist_params.chunk(2, dim=-1)
 
-        obj = gp.quicksum(self.costs_mean[i] * x[k] for i, k in enumerate(x))
+        m, x = super()._getModel()  # get a fresh model
+        obj = gp.quicksum(costs_mean[i] * x[k] for i, k in enumerate(x))
 
-        # t is a dummy variable to track the upper bound on sqrt(x^T * cov * x)
-        obj_std = m.addVar(name="t")
-        # so, t^2 >= x^T * cov * x
+        # s is a dummy variable to track the upper bound on sqrt(x^T * cov * x)
+        obj_std = m.addVar(name="s")
+        # so, s^2 >= x^T * cov * x
         # cov is diagonal so x^T * cov * x = x * cov_ii * x = std^2 * x^2
-        m.addConstr(obj_std**2 >= gp.quicksum((self.costs_std[i] ** 2) * (x[k] ** 2) for i, k in enumerate(x)))
+        m.addConstr(obj_std**2 >= gp.quicksum((costs_std[i] ** 2) * (x[k] ** 2) for i, k in enumerate(x)))
         m.setObjective(obj + self.quantile * obj_std)
 
-        return m, x
-
-    def setObj(self, c):
-        raise Exception("Setting objective isn't allowed because it changes the problem constraints")
+        self._model, self.x = m, x
