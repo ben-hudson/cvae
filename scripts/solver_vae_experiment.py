@@ -213,9 +213,9 @@ if __name__ == "__main__":
         data_model, processes=args.workers, n_samples=10, solve_ratio=1.0, dataset=train_set, two_sides=True
     )
     if args.risk_level == 0.5:
-        parallel_solver = ParallelSolver(1, pyepo.model.grb.shortestPathModel, grid)
+        parallel_solver = ParallelSolver(args.workers, pyepo.model.grb.shortestPathModel, grid)
     else:
-        parallel_solver = ParallelSolver(1, CVaRShortestPath, grid, args.risk_level, tail="right")
+        parallel_solver = ParallelSolver(args.workers, CVaRShortestPath, grid, args.risk_level, tail="right")
 
     metrics = defaultdict(Average)
     metrics["val/obj_true"] = WandBHistogram()
