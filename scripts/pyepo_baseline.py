@@ -3,12 +3,15 @@ import numpy as np
 import pyepo
 import pyepo.metric
 import torch
+import torch.utils
 import tqdm
 
 from collections import defaultdict
 from ignite.metrics import Average
+from data.pyepo import PyEPODataset
+from models.parallel_solver import ParallelSolver
 from models.risk_averse import CVaRShortestPath
-from utils import get_sample_val_metrics, get_wandb_name, WandBHistogram
+from utils import get_val_metrics, get_wandb_name, WandBHistogram
 
 
 def get_argparser():
@@ -20,6 +23,7 @@ def get_argparser():
     dataset_args.add_argument("--n_features", type=int, default=5, help="Number of features")
     dataset_args.add_argument("--degree", type=int, default=1, help="Polynomial degree for encoding function")
     dataset_args.add_argument("--noise_width", type=float, default=0.5, help="Half-width of latent uniform noise")
+    dataset_args.add_argument("--workers", type=int, default=2, help="Number of DataLoader workers")
     dataset_args.add_argument("--seed", type=int, default=135, help="RNG seed")
 
     model_args = parser.add_argument_group("model", description="Model arguments")
@@ -84,6 +88,7 @@ if __name__ == "__main__":
         costs_std = args.noise_width / costs_expected.abs()
 
         cost_dist = "normal"
+        cost_dist_params = torch.cat([costs_expected, costs_std], dim=-1)
         costs = torch.distributions.Normal(costs_expected, costs_std).sample()
 
         data_model = pyepo.model.grb.shortestPathModel(grid)
@@ -91,79 +96,66 @@ if __name__ == "__main__":
     else:
         raise ValueError(f"unknown dataset {args.dataset}")
 
-    cost_marginal_mean = costs.mean(dim=0)
-    cost_marginal_std = costs.std(dim=0, correction=0)
-
-    metrics = defaultdict(Average)
-    # override these two
-    metrics["val/obj_true"] = WandBHistogram()
-    metrics["val/obj_realized"] = WandBHistogram()
-
     # we want to report the running average every so often
     # so we divide the total number of samples into "batches"
     batch_size = args.n_samples // args.max_epochs
 
-    objs_true = []
-    sols_true = []
+    dataset = PyEPODataset(data_model, feats, costs, cost_dist_params)
+    dataloader = torch.utils.data.DataLoader(
+        dataset, batch_size=batch_size, shuffle=False, num_workers=args.workers, drop_last=False
+    )
 
-    for i in tqdm.trange(args.n_samples):
-        cost_true = costs[i]
+    cost_marginal_mean = costs.mean(dim=0)
+    cost_marginal_std = costs.std(dim=0, correction=0)
 
-        if cost_dist == "uniform":
-            cost_dist_true = torch.distributions.Uniform(cost_dist_los[i], cost_dist_his[i])
-        elif cost_dist == "normal":
-            cost_dist_true = torch.distributions.Normal(costs_expected[i], costs_std[i])
-        else:
-            raise ValueError(f"unknown distribution {cost_dist}")
+    if args.baseline != "ra_oracle":
+        solver = ParallelSolver(args.workers, pyepo.model.grb.shortestPathModel, grid)
+    else:
+        solver = ParallelSolver(args.workers, CVaRShortestPath, grid, 0.99, tail="right")
 
-        data_model.setObj(cost_true)
-        sol_true, obj_true = data_model.solve()
-        sol_true = torch.FloatTensor(sol_true)
-        sols_true.append(sol_true)
-        objs_true.append(obj_true)
+    metrics = defaultdict(Average)
+    # override these
+    metrics["val/obj_true"] = WandBHistogram()
+    metrics["val/obj_pred"] = WandBHistogram()
+    metrics["val/obj_expected"] = WandBHistogram()
+    metrics["val/obj_realized"] = WandBHistogram()
+
+    for epoch, batch in enumerate(dataloader):
+        feats, costs, sols, objs, cost_dist_params = batch
+        cost_dist_mean, cost_dist_std = cost_dist_params.chunk(2, dim=-1)
+        cost_dist = torch.distributions.Normal(cost_dist_mean, cost_dist_std)
 
         if args.baseline == "ra_oracle":
-            cost_pred = costs_expected[i]
-            cost_pred_std = costs_std[i]
-            ra_data_model = CVaRShortestPath(grid, cost_pred, cost_pred_std, 0.99, tail="right")
-            sol_pred, _ = ra_data_model.solve()
+            y_pred = cost_dist_params
+            costs_pred = cost_dist_mean
+        elif args.baseline == "oracle":
+            y_pred = costs_pred = cost_dist_mean
+        elif args.baseline == "random":
+            y_pred = costs_pred = cost_marginal_mean + cost_marginal_std * torch.randn_like(costs)
+        elif args.baseline == "mean":
+            y_pred = costs_pred = cost_marginal_mean.expand_as(costs)
 
-        else:
-            if args.baseline == "oracle":
-                cost_pred = costs_expected[i]
-            elif args.baseline == "random":
-                cost_pred = cost_marginal_mean + cost_marginal_std * torch.randn_like(cost_true)
-            elif args.baseline == "mean":
-                cost_pred = cost_marginal_mean
-            else:
-                raise ValueError(f"unknown baseline {args.model}")
+        sols_pred = solver(y_pred)
 
-            data_model.setObj(cost_pred)
-            sol_pred, _ = data_model.solve()
+        objs_pred = torch.bmm(costs_pred.unsqueeze(1), sols_pred.unsqueeze(2)).squeeze(2)
 
-        cost_dist_pred = torch.distributions.Normal(costs_expected[i], costs_std[i])
-
-        sol_pred = (torch.FloatTensor(sol_pred) > 0.5).to(torch.float32)
-        obj_pred = torch.dot(cost_pred, sol_pred)
-
-        sample_metrics = get_sample_val_metrics(
-            data_model,
-            cost_true,
-            sol_true,
-            obj_true,
-            cost_dist_true,
-            cost_pred,
-            sol_pred,
-            obj_pred,
-            cost_dist_pred,
-            is_integer,
+        eval_metrics = get_val_metrics(
+            costs,
+            sols,
+            objs,
+            cost_dist,
+            costs_pred,
+            sols_pred,
+            objs_pred,
+            cost_dist,
+            data_model.modelSense,
+            dataset.is_integer,
+            dataset.class_weights,
         )
 
-        for name, value in sample_metrics._asdict().items():
-            if not np.isinf(value):
-                metrics["val/" + name].update(value)
+        for name, value in eval_metrics._asdict().items():
+            metrics["val/" + name].update(value)
 
-        if i % batch_size == 0:
-            report_metrics(metrics, i // batch_size, args.use_wandb)
+        report_metrics(metrics, epoch, args.use_wandb)
 
     report_metrics(metrics, args.max_epochs, args.use_wandb)

@@ -1,4 +1,6 @@
 import argparse
+import os
+import pathlib
 import pyepo
 import pyepo.data
 import pyepo.metric
@@ -49,6 +51,7 @@ def get_argparser():
     train_args.add_argument("--momentum", type=float, default=8e-2, help="Optimizer momentum")
     train_args.add_argument("--max_epochs", type=int, default=500, help="Maximum number of training epochs")
     train_args.add_argument("--max_hours", type=int, default=3, help="Maximum hours to train")
+    train_args.add_argument("--save_every", type=int, default=10, help="Save model weights every n epochs")
 
     eval_args = parser.add_argument_group("evaluation", description="Evaluation arguments")
     eval_args.add_argument("--eval_every", type=int, default=10, help="Evaluate every n epochs")
@@ -164,10 +167,11 @@ if __name__ == "__main__":
     if args.use_wandb:
         import wandb
 
+        run_name = get_wandb_name(args, argparser)
         run = wandb.init(
             project=args.wandb_project,
             config=args,
-            name=get_wandb_name(args, argparser),
+            name=run_name,
             tags=["experiment"] + args.wandb_tags,
         )
 
@@ -210,7 +214,7 @@ if __name__ == "__main__":
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     imle = pyepo.func.implicitMLE(
-        data_model, processes=args.workers, n_samples=10, solve_ratio=1.0, dataset=train_set, two_sides=True
+        data_model, processes=args.workers, n_samples=16, solve_ratio=1.0, dataset=train_set, two_sides=True
     )
     if args.risk_level == 0.5:
         parallel_solver = ParallelSolver(args.workers, pyepo.model.grb.shortestPathModel, grid)
@@ -219,6 +223,8 @@ if __name__ == "__main__":
 
     metrics = defaultdict(Average)
     metrics["val/obj_true"] = WandBHistogram()
+    metrics["val/obj_pred"] = WandBHistogram()
+    metrics["val/obj_expected"] = WandBHistogram()
     metrics["val/obj_realized"] = WandBHistogram()
 
     progress_bar = tqdm.trange(args.max_epochs)
@@ -253,6 +259,14 @@ if __name__ == "__main__":
 
         if args.use_wandb:
             wandb.log(to_log, step=epoch)
+
+            if epoch % args.save_every == 0:
+                model_dir = os.environ.get("SLURM_TMPDIR", ".")
+                model_path = pathlib.Path(model_dir) / "model.pt"
+                name = run_name.replace(":", "_")
+                alias = run_name.replace(":", "=") + f"_epoch={epoch}"
+                torch.save(model.state_dict(), model_path)
+                wandb.log_model(name=name, path=model_path, aliases=[alias])
         else:
             progress_bar.set_postfix(to_log)
 
