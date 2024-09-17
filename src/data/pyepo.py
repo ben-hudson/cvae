@@ -1,12 +1,13 @@
 import networkx as nx
 import numpy as np
-import torch
 import pyepo
+import torch
 
 from collections import namedtuple
 from matplotlib import pyplot as plt
 from pyepo.data.dataset import optDataset
 from sklearn.utils import compute_class_weight
+from typing import Tuple
 
 PyEPOData = namedtuple("PyEPOData", "feats costs sols objs cost_params")
 
@@ -88,6 +89,32 @@ class PyEPODataset(optDataset):
         return PyEPOData(
             self.feats[index], self.costs[index], self.sols[index], self.objs[index], self.cost_params[index]
         )
+
+
+def gen_shortestpath_data(
+    n_samples: int, n_features: int, grid: Tuple[int], degree: int, noise_width: float, seed: int
+):
+    feats, expected_costs = pyepo.data.shortestpath.genData(
+        n_samples, n_features, grid, deg=degree, noise_width=0, seed=seed
+    )
+
+    feats = torch.FloatTensor(feats)
+    expected_costs = torch.FloatTensor(expected_costs)
+
+    cost_dist_scales = noise_width / expected_costs.abs()
+
+    cost_samples = torch.distributions.Normal(expected_costs, cost_dist_scales).sample()
+
+    # we apply a samplewise unit norm to the costs and cost distributions
+    # this does not affect the solutions, but it does change some metrics
+    cost_sample_norms = cost_samples.norm(dim=-1).unsqueeze(-1)
+    cost_samples_normed = cost_samples / cost_sample_norms
+    # this is a linear transformation, and so it is valid to apply it to the cost distributions
+    # see https://en.wikipedia.org/wiki/Normal_distribution#Operations_and_functions_of_normal_variables
+    cost_dist_norms = expected_costs.norm(dim=-1).unsqueeze(-1)
+    cost_dist_params_normed = torch.cat([expected_costs / cost_dist_norms, cost_dist_scales / cost_dist_norms], dim=-1)
+
+    return feats, cost_samples_normed, cost_dist_params_normed
 
 
 def render_shortestpath(data_model, sol):

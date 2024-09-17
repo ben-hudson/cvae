@@ -1,14 +1,12 @@
 import argparse
-import numpy as np
 import pyepo
 import pyepo.metric
 import torch
 import torch.utils
-import tqdm
 
 from collections import defaultdict
+from data.pyepo import PyEPODataset, gen_shortestpath_data
 from ignite.metrics import Average
-from data.pyepo import PyEPODataset
 from models.parallel_solver import ParallelSolver
 from models.risk_averse import CVaRShortestPath
 from utils import get_val_metrics, get_wandb_name, WandBHistogram
@@ -23,7 +21,7 @@ def get_argparser():
     dataset_args.add_argument("--n_features", type=int, default=5, help="Number of features")
     dataset_args.add_argument("--degree", type=int, default=1, help="Polynomial degree for encoding function")
     dataset_args.add_argument("--noise_width", type=float, default=0.5, help="Half-width of latent uniform noise")
-    dataset_args.add_argument("--workers", type=int, default=2, help="Number of DataLoader workers")
+    dataset_args.add_argument("--workers", type=int, default=1, help="Number of DataLoader workers")
     dataset_args.add_argument("--seed", type=int, default=135, help="RNG seed")
 
     model_args = parser.add_argument_group("model", description="Model arguments")
@@ -70,7 +68,6 @@ if __name__ == "__main__":
             tags=["baseline"] + args.wandb_tags,
         )
 
-    rng = np.random.RandomState(args.seed)
     torch.manual_seed(args.seed)
 
     # to generate the "oracle" predictions we generate the data with no noise, and then add noise back in to get the observations
@@ -78,19 +75,9 @@ if __name__ == "__main__":
     if args.dataset == "shortestpath":
         is_integer = True
         grid = (5, 5)
-        feats, costs_expected = pyepo.data.shortestpath.genData(
-            args.n_samples, args.n_features, grid, deg=args.degree, noise_width=0, seed=args.seed
+        feats, costs, cost_dist_params = gen_shortestpath_data(
+            args.n_samples, args.n_features, grid, args.degree, args.noise_width, args.seed
         )
-
-        feats = torch.FloatTensor(feats)
-        costs_expected = torch.FloatTensor(costs_expected)
-
-        costs_std = args.noise_width / costs_expected.abs()
-
-        cost_dist = "normal"
-        cost_dist_params = torch.cat([costs_expected, costs_std], dim=-1)
-        costs = torch.distributions.Normal(costs_expected, costs_std).sample()
-
         data_model = pyepo.model.grb.shortestPathModel(grid)
 
     else:
