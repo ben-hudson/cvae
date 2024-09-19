@@ -3,6 +3,7 @@ import os
 import pathlib
 import pyepo
 import pyepo.data
+import pyepo.func
 import pyepo.metric
 import pyepo.model
 import torch
@@ -20,7 +21,7 @@ from models.solver_vae import SolverVAE
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 from typing import Sequence, Dict, Tuple
-from utils import get_val_metrics, get_wandb_name, WandBHistogram, norm_normal
+from utils import get_eval_metrics, get_wandb_name, WandBHistogram, norm_normal
 
 
 def get_argparser():
@@ -50,6 +51,12 @@ def get_argparser():
     train_args.add_argument("--lr", type=float, default=1e-5, help="Optimizer learning rate")
     train_args.add_argument(
         "--kld_weight", type=float, default=0.5, help="Relative weighting of KLD and reconstruction loss"
+    )
+    train_args.add_argument(
+        "--solver_perturb_temp", type=float, default=1.0, help="Temperature of solver input perturbation distribution"
+    )
+    train_args.add_argument(
+        "--solver_perturb_samples", type=int, default=10, help="Samples to solve when computing solver gradient"
     )
     train_args.add_argument("--momentum", type=float, default=8e-2, help="Optimizer momentum")
     train_args.add_argument("--max_epochs", type=int, default=500, help="Maximum number of training epochs")
@@ -124,7 +131,7 @@ def train_step(model, solver, batch, device, train_set, kld_weight, norm_latent_
     return loss, train_metrics
 
 
-def eval_step(model, solver, batch, device, train_set, risk_level, norm_latent_dists):
+def eval_step(model, data_model, solver, batch, device, train_set, risk_level, norm_latent_dists):
     feats, costs, sols, objs, cost_dist_params = batch
     feats = feats.to(device)
     costs = costs.to(device)
@@ -151,7 +158,7 @@ def eval_step(model, solver, batch, device, train_set, risk_level, norm_latent_d
     costs_pred = prior_normed.loc
     objs_pred = torch.bmm(costs_pred.unsqueeze(1), sols_pred.unsqueeze(2)).squeeze(2)
 
-    eval_metrics = get_val_metrics(
+    eval_metrics = get_eval_metrics(
         costs,
         sols,
         objs,
@@ -213,7 +220,13 @@ if __name__ == "__main__":
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     imle = pyepo.func.implicitMLE(
-        data_model, processes=args.workers, n_samples=16, solve_ratio=1.0, dataset=train_set, two_sides=True
+        data_model,
+        processes=args.workers,
+        n_samples=args.solver_perturb_samples,
+        sigma=args.solver_perturb_temp,
+        two_sides=True,
+        solve_ratio=1.0,
+        dataset=train_set,
     )
     if args.risk_level == 0.5:
         parallel_solver = ParallelSolver(args.workers, pyepo.model.grb.shortestPathModel, grid)
@@ -247,7 +260,14 @@ if __name__ == "__main__":
             with torch.no_grad():
                 for batch in test_loader:
                     eval_metrics = eval_step(
-                        model, parallel_solver, batch, device, train_set, args.risk_level, args.norm_latent_dists
+                        model,
+                        data_model,
+                        parallel_solver,
+                        batch,
+                        device,
+                        train_set,
+                        args.risk_level,
+                        args.norm_latent_dists,
                     )
 
                     for name, value in eval_metrics._asdict().items():

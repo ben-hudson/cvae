@@ -14,7 +14,7 @@ ValMetrics = namedtuple(
 )
 
 
-def get_val_metrics(
+def get_eval_metrics(
     cost_true: torch.Tensor,
     sol_true: torch.Tensor,
     obj_true: torch.Tensor,  # wait-and-see solution value with true cost realizations
