@@ -7,6 +7,7 @@ import torch.distributions as D
 from collections import namedtuple
 from typing import Sequence
 
+from utils.utils import norm, norm_normal, is_integer
 
 ValMetrics = namedtuple(
     "ValMetrics",
@@ -17,19 +18,28 @@ ValMetrics = namedtuple(
 def get_eval_metrics(
     cost_true: torch.Tensor,
     sol_true: torch.Tensor,
-    obj_true: torch.Tensor,  # wait-and-see solution value with true cost realizations
     cost_dist_true: D.Distribution,
     cost_pred: torch.Tensor,
     sol_pred: torch.Tensor,
-    obj_pred: torch.Tensor,  # predicted solution value with learned cost expectations
     cost_dist_pred: D.Distribution,
     model_sense: int = pyepo.EPO.MINIMIZE,
-    is_integer: bool = False,
     class_weights: Sequence = None,
 ):
+    cost_true = norm(cost_true)
+    cost_pred = norm(cost_pred)
+
+    assert is_integer(sol_true)
+    assert is_integer(sol_pred)
+
+    cost_dist_true = norm_normal(cost_dist_true)
+    cost_dist_pred = norm_normal(cost_dist_pred)
+
+    # wait-and-see solution value with true cost realizations
+    obj_true = torch.bmm(cost_true.unsqueeze(1), sol_true.unsqueeze(2)).squeeze(2)
+    # predicted solution value with learned cost expectations
+    obj_pred = torch.bmm(cost_pred.unsqueeze(1), sol_pred.unsqueeze(2)).squeeze(2)
     # predicted solution value with true cost realizations
     obj_realized = torch.bmm(cost_true.unsqueeze(1), sol_pred.unsqueeze(2)).squeeze(2)
-
     # predicted solution value with true cost expectations
     obj_expected = torch.bmm(cost_dist_true.loc.unsqueeze(1), sol_pred.unsqueeze(2)).squeeze(2)
 
@@ -44,7 +54,7 @@ def get_eval_metrics(
         disappointment, surprise = surprise, disappointment
 
     cost_err = F.mse_loss(cost_pred, cost_true, reduction="mean")
-    if is_integer:
+    if is_integer(sol_true) and is_integer(sol_pred):
         if class_weights is not None:
             sample_weights = torch.empty_like(sol_true)
             sample_weights[sol_true == 0] = class_weights[0]

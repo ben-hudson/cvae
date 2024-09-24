@@ -8,6 +8,7 @@ from matplotlib import pyplot as plt
 from pyepo.data.dataset import optDataset
 from sklearn.utils import compute_class_weight
 from typing import Tuple
+from utils.utils import is_integer
 
 PyEPOData = namedtuple("PyEPOData", "feats costs sols objs cost_params")
 
@@ -20,7 +21,7 @@ class PyEPODataset(optDataset):
         self.objs = torch.FloatTensor(self.objs)
         self.cost_params = cost_params
 
-        self.is_integer = ((self.sols == 0) | (self.sols == 1)).all()
+        self.is_integer = is_integer(self.sols)
 
         self.means = PyEPOData(
             self.feats.mean(dim=0, keepdim=True),

@@ -1,12 +1,17 @@
 import argparse
+import os
+import pathlib
 import torch
+import uuid
 import wandb
 
 from ignite.exceptions import NotComputableError
 from ignite.metrics import Metric
 
+from typing import Dict
 
-def get_wandb_name(args: argparse.Namespace, argparser: argparse.ArgumentParser):
+
+def get_friendly_name(args: argparse.Namespace, argparser: argparse.ArgumentParser):
     nondefault_values = []
     for name, value in vars(args).items():
         default_value = argparser.get_default(name)
@@ -18,6 +23,35 @@ def get_wandb_name(args: argparse.Namespace, argparser: argparse.ArgumentParser)
 
     name = "_".join(f"{name}:{value}" for name, value in nondefault_values)
     return name
+
+
+def record_metrics(metrics: Dict[str, Metric], epoch: int):
+    for name, metric in metrics.items():
+        try:
+            val = metric.compute()
+            if isinstance(val, torch.Tensor) and val.dim() > 0:
+                wandb.log({name: wandb.Histogram(val)}, step=epoch)
+            else:
+                wandb.log({name: val}, step=epoch)
+        except NotComputableError:
+            pass
+
+
+def save_metrics(metrics: Dict[str, Metric], epoch: int):
+    artifact_name = f"{wandb.run.id}_epoch_{epoch}"
+    artifact = wandb.Artifact(artifact_name, "metrics")
+    tmp_dir = pathlib.Path(os.environ.get("SLURM_TMPDIR", "/tmp"))
+
+    for name, metric in metrics.items():
+        assert os.path.sep not in name, f"{name} includes a path separator"
+        val = metric.compute()
+        # lazy attempt to covert to a tensor
+        if not isinstance(val, torch.Tensor):
+            val = torch.Tensor(val)
+        path = tmp_dir / f"{name}.pt"
+        torch.save(val, path)
+        artifact.add_file(path)
+    wandb.log_artifact(artifact)
 
 
 class WandBHistogram(Metric):

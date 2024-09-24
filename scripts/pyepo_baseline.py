@@ -5,6 +5,7 @@ import pyepo
 import pyepo.metric
 import torch
 import torch.utils
+import tqdm
 
 from collections import defaultdict
 from data.pyepo import PyEPODataset, gen_shortestpath_data
@@ -12,24 +13,28 @@ from ignite.metrics import Average
 from models.parallel_solver import ParallelSolver
 from models.risk_averse import CVaRShortestPath
 from models.solver_vae import SolverVAE
-from utils import get_eval_metrics, get_wandb_name, WandBHistogram, norm_normal
+from utils.accumulator import Accumulator
+from utils.eval import get_eval_metrics
+from utils.wandb import get_friendly_name, record_metrics, save_metrics
 
 
 def get_argparser():
     parser = argparse.ArgumentParser("Run a baseline on a dataset")
 
+    # we need to keep default=None for all arguments so we can tell if we should override them from the config values
+    # effectively, the config values become defaults
     parser.add_argument(
         "--config", type=pathlib.Path, help="WandB experiment config to reproduce (additional arguments override)"
     )
 
     dataset_args = parser.add_argument_group("dataset", description="Dataset arguments")
-    dataset_args.add_argument("--dataset", type=str, choices=["shortestpath", "portfolio"], help="Dataset to generate")
-    dataset_args.add_argument("--n_samples", type=int, default=2000, help="Number of samples to generate")
-    dataset_args.add_argument("--n_features", type=int, default=5, help="Number of features")
-    dataset_args.add_argument("--degree", type=int, default=1, help="Polynomial degree for encoding function")
-    dataset_args.add_argument("--noise_width", type=float, default=0.5, help="Half-width of latent uniform noise")
-    dataset_args.add_argument("--workers", type=int, default=1, help="Number of DataLoader workers")
-    dataset_args.add_argument("--seed", type=int, default=135, help="RNG seed")
+    dataset_args.add_argument("--dataset", type=str, choices=["shortestpath"], help="Dataset to generate")
+    dataset_args.add_argument("--n_samples", type=int, help="Number of samples to generate")
+    dataset_args.add_argument("--n_features", type=int, help="Number of features")
+    dataset_args.add_argument("--degree", type=int, help="Polynomial degree for encoding function")
+    dataset_args.add_argument("--noise_width", type=float, help="Half-width of latent uniform noise")
+    dataset_args.add_argument("--workers", type=int, help="Number of DataLoader workers")
+    dataset_args.add_argument("--seed", type=int, help="RNG seed")
 
     model_args = parser.add_argument_group("model", description="Model arguments")
     model_args.add_argument(
@@ -38,15 +43,13 @@ def get_argparser():
     model_args.add_argument("--weights", type=pathlib.Path, help="Weights for pretrained prediction model")
 
     eval_args = parser.add_argument_group("evaluation", description="Evaluation arguments")
-    eval_args.add_argument(
-        "--risk_level", type=float, default=0.5, help="Risk level (probability) for risk-averse decision-making"
-    )
+    eval_args.add_argument("--risk_level", type=float, help="Risk level (probability) for risk-averse decision-making")
 
     train_args = parser.add_argument_group("training", description="Training arguments")
-    train_args.add_argument("--max_epochs", type=int, default=500, help="Maximum number of training epochs")
+    train_args.add_argument("--max_epochs", type=int, help="Maximum number of training epochs")
 
     model_args = parser.add_argument_group("logging", description="Logging arguments")
-    model_args.add_argument("--wandb_project", type=str, default=None, help="WandB project name")
+    model_args.add_argument("--wandb_project", type=str, help="WandB project name")
     model_args.add_argument("--wandb_tags", type=str, nargs="+", default=[], help="WandB tags")
 
     return parser
@@ -62,20 +65,6 @@ def set_args_from_config(args, config):
     return args
 
 
-def report_metrics(metrics: dict, step: int, use_wandb: bool):
-    log = {name: avg.compute() for name, avg in metrics.items()}
-
-    if use_wandb:
-        wandb.log(log, step=step)
-    else:
-        print(f"step: {step}")
-        for name, val in log.items():
-            try:
-                print(f"{name}: {val:.4f}")
-            except Exception as e:
-                print(f"{name}: {e}")
-
-
 if __name__ == "__main__":
     argparser = get_argparser()
     args = argparser.parse_args()
@@ -87,6 +76,8 @@ if __name__ == "__main__":
     if args.use_wandb:
         import wandb
 
+        run_name = get_friendly_name(args, argparser)
+
         if args.model is not None:
             tags = ["experiment"]
         elif args.baseline is not None:
@@ -95,7 +86,7 @@ if __name__ == "__main__":
         run = wandb.init(
             project=args.wandb_project,
             config=args,
-            name=get_wandb_name(args, argparser),
+            name=run_name,
             tags=tags + args.wandb_tags,
         )
 
@@ -145,12 +136,12 @@ if __name__ == "__main__":
 
     metrics = defaultdict(Average)
     # override these
-    metrics["val/obj_true"] = WandBHistogram()
-    metrics["val/obj_pred"] = WandBHistogram()
-    metrics["val/obj_expected"] = WandBHistogram()
-    metrics["val/obj_realized"] = WandBHistogram()
+    metrics["val/obj_true"] = Accumulator()
+    metrics["val/obj_pred"] = Accumulator()
+    metrics["val/obj_expected"] = Accumulator()
+    metrics["val/obj_realized"] = Accumulator()
 
-    for epoch, batch in enumerate(dataloader):
+    for epoch, batch in tqdm.tqdm(enumerate(dataloader), total=args.max_epochs):
         feats, costs, sols, objs, cost_dist_params = batch
         cost_dist_mean, cost_dist_std = cost_dist_params.chunk(2, dim=-1)
         cost_dist = torch.distributions.Normal(cost_dist_mean, cost_dist_std)
@@ -158,8 +149,7 @@ if __name__ == "__main__":
         if args.model == "pretrained":
             with torch.no_grad():
                 feats_normed, _, _, _, _ = dataset.norm(feats=feats)
-                prior = model.sample(feats_normed)
-                prior_normed = norm_normal(prior)
+                prior_normed = model.predict(feats_normed, point_prediction=False)
                 if args.risk_level == 0.5:
                     y_pred = prior_normed.loc
                 else:
@@ -173,8 +163,25 @@ if __name__ == "__main__":
                 y_pred = cost_dist_params
             costs_pred = cost_dist_mean
 
+        elif args.model == "mean":
+            costs_pred_unnorm = dataset.means.costs.expand_as(costs)
+            costs_pred_norm = costs_pred_unnorm.norm(dim=-1).unsqueeze(-1)
+            costs_pred = costs_pred_unnorm / costs_pred_norm
+            if args.risk_level == 0.5:
+                y_pred = costs_pred
+            else:
+                y_pred = torch.cat([costs_pred, dataset.scales.costs.expand_as(costs) / costs_pred_norm], dim=-1)
+
+        elif args.model == "random":
+            costs_pred_unnorm = dataset.means.costs + torch.rand_like(costs) * dataset.scales.costs
+            costs_pred = costs_pred_unnorm / costs_pred_unnorm.norm(dim=-1).unsqueeze(-1)
+            if args.risk_level == 0.5:
+                y_pred = costs_pred
+            else:
+                raise ValueError("no risk averse random baseline")
+
         else:
-            raise ValueError(f"unknown baseline {args.baseline}")
+            raise ValueError(f"unknown baseline {args.model}")
 
         sols_pred = solver(y_pred)
 
@@ -197,6 +204,8 @@ if __name__ == "__main__":
         for name, value in eval_metrics._asdict().items():
             metrics["val/" + name].update(value)
 
-        report_metrics(metrics, epoch, args.use_wandb)
+        if args.use_wandb:
+            record_metrics(metrics, epoch)
 
-    report_metrics(metrics, args.max_epochs, args.use_wandb)
+    if args.use_wandb:
+        save_metrics(metrics, args.max_epochs)

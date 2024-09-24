@@ -1,6 +1,5 @@
 import torch
 
-from .knapsack import *
 from .shortestpath import *
 
 

@@ -1,7 +1,7 @@
 import torch
 import multiprocessing as mp
 
-from utils import quiet
+from utils.utils import quiet
 
 
 class ParallelSolver(torch.nn.Module):
@@ -20,16 +20,26 @@ class ParallelSolver(torch.nn.Module):
 
         # solve
         if self.processes > 1:
-            chunks = costs.chunk(self.processes, dim=0)
+            sols = []
             with mp.Pool(processes=self.processes) as pool:
-                sols = pool.map(self._solve, chunks)
-                sols = torch.FloatTensor(sols).flatten(0, 1)
+                for sol in pool.imap(self._solve_instance, costs):
+                    sols.append(sol)
+                pool.close()
+                pool.join()
         else:
             sols = self._solve(costs)
-            sols = torch.FloatTensor(sols)
+
+        sols = torch.FloatTensor(sols)
         sols = (sols > 0.5).float().to(device)
 
         return sols
+
+    def _solve_instance(self, costs):
+        model = self.model_cls(*self.model_args, **self.model_kwargs)
+        model.setObj(costs)
+        with quiet():
+            sol, _ = model.solve()
+        return sol
 
     def _solve(self, costs):
         model = self.model_cls(*self.model_args, **self.model_kwargs)

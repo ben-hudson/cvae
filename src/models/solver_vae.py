@@ -1,9 +1,13 @@
+import pyepo.func.abcmodule
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from torch.distributions import kl_divergence, Normal
 from torchvision.ops import MLP
+from typing import Dict, Sequence, Tuple
+
+from utils.utils import norm, norm_normal
 
 
 class SolverVAE(nn.Module):
@@ -30,7 +34,7 @@ class SolverVAE(nn.Module):
             activation_layer=torch.nn.SiLU,
         )
         # p_\theta(decision|context,latent) - takes latent samples and reconstructs them into decisions
-        # this is done inside the SPO+ loss function, so we just return the sampled costs directly
+        # this is the perturb-and-MAP solver, which perturbs the input to the solver to get a "smoothed" solution
 
         # q_\phi(latent|context,decision) - latent samples come from here
         # this is the one we sample from, and then put IT in to the generation net
@@ -40,12 +44,16 @@ class SolverVAE(nn.Module):
             activation_layer=torch.nn.SiLU,
         )
 
-    def _get_normal(self, mean: torch.Tensor, logvar: torch.Tensor, eps: float = 1e-6):
+    def _get_normal(self, mean: torch.Tensor, logvar: torch.Tensor, eps: float = 1e-6) -> Normal:
         var = torch.exp(logvar) + eps
         std = torch.sqrt(var)
         return Normal(mean, std)
 
-    def forward(self, context: torch.Tensor, obs: torch.Tensor):
+    def forward(
+        self,
+        context: torch.Tensor,
+        obs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         prior_mean, prior_logvar = self.prior_net(context).chunk(self.params_per_cost, dim=-1)
         posterior_mean, posterior_logvar = self.recognition_net(torch.cat([context, obs], dim=-1)).chunk(
             self.params_per_cost, dim=-1
@@ -54,10 +62,17 @@ class SolverVAE(nn.Module):
         prior = self._get_normal(prior_mean, prior_logvar)
         posterior = self._get_normal(posterior_mean, posterior_logvar)
 
-        return prior, posterior
+        return norm_normal(prior), norm_normal(posterior)
 
-    def sample(self, context: torch.Tensor):
+    def predict(
+        self,
+        context: torch.Tensor,
+        point_prediction: bool = True,
+    ) -> torch.Tensor:
         prior_mean, prior_logvar = self.prior_net(context).chunk(self.params_per_cost, dim=-1)
 
-        prior = self._get_normal(prior_mean, prior_logvar)
-        return prior
+        if point_prediction:
+            return norm(prior_mean)
+        else:
+            prior = self._get_normal(prior_mean, prior_logvar)
+            return norm_normal(prior)

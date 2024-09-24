@@ -16,12 +16,15 @@ from data.pyepo import PyEPODataset, gen_shortestpath_data
 from ignite.exceptions import NotComputableError
 from ignite.metrics import Average
 from models.parallel_solver import ParallelSolver
-from models.risk_averse import VaRShortestPath, CVaRShortestPath
+from models.risk_averse import CVaRShortestPath
 from models.solver_vae import SolverVAE
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
-from typing import Sequence, Dict, Tuple
-from utils import get_eval_metrics, get_wandb_name, WandBHistogram, norm_normal
+from typing import Sequence
+from utils.accumulator import Accumulator
+from utils.eval import get_eval_metrics
+from utils.wandb import get_friendly_name, record_metrics, save_metrics
+from utils.utils import norm, norm_normal
 
 
 def get_argparser():
@@ -66,10 +69,7 @@ def get_argparser():
     eval_args = parser.add_argument_group("evaluation", description="Evaluation arguments")
     eval_args.add_argument("--eval_every", type=int, default=10, help="Evaluate every n epochs")
     eval_args.add_argument(
-        "--chance_constraint_budget", type=float, default=None, help="Chance constraint cost threshold"
-    )
-    eval_args.add_argument(
-        "--risk_level", type=float, default=0.5, help="Risk level (probability) for risk-averse decision-making"
+        "--risk_level", type=float, default=None, help="Risk level (probability) for risk-averse decision-making"
     )
 
     model_args = parser.add_argument_group("logging", description="Logging arguments")
@@ -115,15 +115,12 @@ def train_step(model, solver, batch, device, train_set, kld_weight, norm_latent_
     sols = sols.to(device)
 
     prior, posterior = model(feats, sols)
-    if norm_latent_dists:
-        prior = norm_normal(prior)
-        posterior = norm_normal(posterior)
 
     # when we are training, we are imitating the wait-and-see decision-making process, which is risk neutral
     # so we need to use the reparametrization trick
     y_sample = posterior.rsample()
     # norm the result to be consistent with other steps
-    y_sample_normed = y_sample / y_sample.norm(dim=-1).unsqueeze(-1)
+    y_sample_normed = norm(y_sample)
     sols_pred = solver(y_sample_normed)
 
     loss, train_metrics = get_train_metrics(prior, posterior, sols, sols_pred, train_set.class_weights, kld_weight)
@@ -142,33 +139,23 @@ def eval_step(model, data_model, solver, batch, device, train_set, risk_level, n
 
     feats_normed, _, _, _, _ = train_set.norm(feats=feats)
 
-    prior = model.sample(feats_normed.to(device))
-    prior_normed = norm_normal(prior)
+    cost_dist_pred = model.predict(feats_normed, point_prediction=False)
+    costs_pred = cost_dist_pred.loc
 
-    if risk_level == 0.5:
-        # we use the expectation for the risk neutral model
-        y_pred = prior_normed.loc
+    if risk_level is None:
+        sols_pred = solver(cost_dist_pred.loc)
     else:
-        # we use all parameters of the prior for the risk averse model
-        y_pred = torch.cat([prior_normed.loc, prior_normed.scale], dim=-1)
-
-    sols_pred = solver(y_pred)
-
-    # in both cases, the objective is calculated with the expectation
-    costs_pred = prior_normed.loc
-    objs_pred = torch.bmm(costs_pred.unsqueeze(1), sols_pred.unsqueeze(2)).squeeze(2)
+        cost_dist_pred_params = torch.cat([cost_dist_pred.loc, cost_dist_pred.scale], dim=-1)
+        sols_pred = solver(cost_dist_pred_params)
 
     eval_metrics = get_eval_metrics(
         costs,
         sols,
-        objs,
         cost_dist,
         costs_pred,
         sols_pred,
-        objs_pred,
-        prior_normed,
+        cost_dist_pred,
         data_model.modelSense,
-        train_set.is_integer,
         train_set.class_weights,
     )
 
@@ -183,7 +170,7 @@ if __name__ == "__main__":
     if args.use_wandb:
         import wandb
 
-        run_name = get_wandb_name(args, argparser)
+        run_name = get_friendly_name(args, argparser)
         run = wandb.init(
             project=args.wandb_project,
             config=args,
@@ -228,16 +215,16 @@ if __name__ == "__main__":
         solve_ratio=1.0,
         dataset=train_set,
     )
-    if args.risk_level == 0.5:
+    if args.risk_level is None:
         parallel_solver = ParallelSolver(args.workers, pyepo.model.grb.shortestPathModel, grid)
     else:
         parallel_solver = ParallelSolver(args.workers, CVaRShortestPath, grid, args.risk_level, tail="right")
 
     metrics = defaultdict(Average)
-    metrics["val/obj_true"] = WandBHistogram()
-    metrics["val/obj_pred"] = WandBHistogram()
-    metrics["val/obj_expected"] = WandBHistogram()
-    metrics["val/obj_realized"] = WandBHistogram()
+    metrics["val/obj_true"] = Accumulator()
+    metrics["val/obj_pred"] = Accumulator()
+    metrics["val/obj_expected"] = Accumulator()
+    metrics["val/obj_realized"] = Accumulator()
 
     progress_bar = tqdm.trange(args.max_epochs)
     for epoch in progress_bar:
@@ -273,15 +260,8 @@ if __name__ == "__main__":
                     for name, value in eval_metrics._asdict().items():
                         metrics["val/" + name].update(value)
 
-        to_log = {}
-        for name, avg in metrics.items():
-            try:
-                to_log[name] = avg.compute()
-            except NotComputableError as e:
-                pass
-
         if args.use_wandb:
-            wandb.log(to_log, step=epoch)
+            record_metrics(metrics, epoch)
 
             if epoch % args.save_every == 0:
                 model_dir = os.environ.get("SLURM_TMPDIR", ".")
@@ -290,8 +270,6 @@ if __name__ == "__main__":
                 alias = run_name.replace(":", "=") + f"_epoch={epoch}"
                 torch.save(model.state_dict(), model_path)
                 wandb.log_model(name=name, path=model_path, aliases=[alias])
-        else:
-            progress_bar.set_postfix(to_log)
 
         for avg in metrics.values():
             avg.reset()

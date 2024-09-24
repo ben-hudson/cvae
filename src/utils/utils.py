@@ -1,6 +1,7 @@
+import torch
+
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from os import devnull
-from torch.distributions import Normal
 
 
 # https://stackoverflow.com/a/52442331/2426888
@@ -12,8 +13,17 @@ def quiet():
             yield (err, out)
 
 
-def norm_normal(dist):
-    assert isinstance(dist, Normal), f"expected a normal distribution but got {type(dist)}"
-    assert dist.loc.dim() == 2, f"expected a 2D tensor (a batch of vectors), but got {dist.loc.dim()}D"
-    norm = dist.loc.norm(dim=-1).unsqueeze(-1)
-    return Normal(dist.loc / norm, dist.scale / norm)
+def norm(batch: torch.Tensor):
+    assert batch.dim() == 2, f"expected a 2D tensor (a batch of vectors), but got a {batch.dim()}D one"
+    return batch / batch.norm(p=2, dim=-1).unsqueeze(-1)
+
+
+def norm_normal(batch: torch.distributions.Normal):
+    assert isinstance(batch, torch.distributions.Normal), f"expected a normal distribution but got {type(batch)}"
+    assert batch.loc.dim() == 2, f"expected a 2D tensor (a batch of vectors), but got {batch.loc.dim()}D one"
+    norm = batch.loc.norm(dim=-1).unsqueeze(-1)
+    return torch.distributions.Normal(batch.loc / norm, batch.scale / norm)
+
+
+def is_integer(batch):
+    return ((batch == 0) | (batch == 1)).all()

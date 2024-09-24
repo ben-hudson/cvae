@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --cpus-per-task=2
-#SBATCH --mem=4G
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=8G
 #SBATCH --time=04:00:00
 #SBATCH --output /network/scratch/b/ben.hudson/slurm/%j.out
 #SBATCH --error /network/scratch/b/ben.hudson/slurm/%j.err
@@ -23,4 +23,4 @@ DATASET=${1}
 BASELINE=${2}
 EXTRA_ARGS=${@:3}
 
-python scripts/pyepo_baseline.py $DATASET $BASELINE --wandb_project pyepo --workers 2 $EXTRA_ARGS
+python scripts/pyepo_baseline.py $DATASET $BASELINE --wandb_project pyepo --workers 8 $EXTRA_ARGS
