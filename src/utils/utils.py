@@ -4,9 +4,10 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from os import devnull
 
 
+# silence output to stdout and stderr
 # https://stackoverflow.com/a/52442331/2426888
 @contextmanager
-def quiet():
+def hush():
     """A context manager that redirects stdout and stderr to devnull"""
     with open(devnull, "w") as fnull:
         with redirect_stderr(fnull) as err, redirect_stdout(fnull) as out:
