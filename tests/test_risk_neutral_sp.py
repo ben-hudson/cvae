@@ -15,13 +15,23 @@ def random_graph():
     return G
 
 
+@pytest.fixture
+def multigraph():
+    G = nx.MultiDiGraph()
+    G.add_edge(0, 1, cost=1.0, sp=True)
+    G.add_edge(0, 1, cost=2.0, sp=False)
+    G.add_edge(1, 2, cost=1.0, sp=True)
+    G.add_edge(1, 2, cost=2.0, sp=False)
+    return G
+
+
 def path_to_sol(path, edges):
     path_edges = list(zip(path[:-1], path[1:]))
     sol = [1 if e in path_edges else 0 for e in edges]
     return torch.FloatTensor(sol)
 
 
-def test_shortestpath(random_graph: nx.DiGraph):
+def test_sp(random_graph: nx.DiGraph):
     node_list = list(random_graph.nodes)
     source = node_list[0]
     sink = node_list[-1]
@@ -40,7 +50,7 @@ def test_shortestpath(random_graph: nx.DiGraph):
     assert (sol == true_sol).all(), f"model and true paths differ"
 
 
-def test_ilp_shortestpath(random_graph: nx.DiGraph):
+def test_ilp_sp(random_graph: nx.DiGraph):
     node_list = list(random_graph.nodes)
     source = node_list[0]
     sink = node_list[-1]
@@ -52,6 +62,26 @@ def test_ilp_shortestpath(random_graph: nx.DiGraph):
     cost = torch.FloatTensor(list(cost_dict.values()))
 
     model = ILPShortestPath(random_graph, source, sink)
+    model.setObj(cost)
+    sol, obj = model.solve()
+
+    assert np.isclose(obj, true_obj), f"model and true objective values differ"
+    assert (sol == true_sol).all(), f"model and true paths differ"
+
+
+def test_multigraph_ilp_sp(multigraph):
+    node_list = list(multigraph.nodes)
+    source = node_list[0]
+    sink = node_list[-1]
+
+    cost_dict = nx.get_edge_attributes(multigraph, "cost")
+    cost = torch.FloatTensor(list(cost_dict.values()))
+
+    true_sol_dict = nx.get_edge_attributes(multigraph, "sp")
+    true_sol = torch.FloatTensor(list(true_sol_dict.values()))
+    true_obj = torch.dot(cost, true_sol)
+
+    model = ILPShortestPath(multigraph, source, sink)
     model.setObj(cost)
     sol, obj = model.solve()
 
