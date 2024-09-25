@@ -7,7 +7,7 @@ from models.shortestpath.risk_neutral import ShortestPath
 from models.shortestpath.risk_averse import VaRShortestPath, CVaRShortestPath, get_obj_dist, get_VaR, get_CVaR
 
 
-# @pytest.fixture
+@pytest.fixture
 def random_graph():
     G = nx.fast_gnp_random_graph(10, 0.3, directed=True)
     node_pos = nx.spring_layout(G)
@@ -16,7 +16,7 @@ def random_graph():
     return G
 
 
-# @pytest.fixture
+@pytest.fixture
 def risk_level():
     return 0.9
 
@@ -79,7 +79,3 @@ def test_CVaR_shortestpath(random_graph: nx.DiGraph, risk_level: float):
     assert np.isclose(risk_neutral_obj_mean, risk_neutral_obj)
     assert np.isclose(risk_averse_obj, risk_averse_CVaR)
     assert risk_neutral_CVaR >= risk_averse_CVaR
-
-
-if __name__ == "__main__":
-    test_VaR_shortestpath(random_graph(), risk_level())
