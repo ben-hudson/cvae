@@ -46,8 +46,8 @@ def test_sp(random_graph: nx.DiGraph):
     model.setObj(cost)
     sol, obj = model.solve()
 
-    assert np.isclose(obj, true_obj), f"model and true objective values differ"
-    assert (sol == true_sol).all(), f"model and true paths differ"
+    assert np.isclose(obj, true_obj), "model and true objective values differ"
+    assert (sol == true_sol).all(), "model and true paths differ"
 
 
 def test_ilp_sp(random_graph: nx.DiGraph):
@@ -65,8 +65,8 @@ def test_ilp_sp(random_graph: nx.DiGraph):
     model.setObj(cost)
     sol, obj = model.solve()
 
-    assert np.isclose(obj, true_obj), f"model and true objective values differ"
-    assert (sol == true_sol).all(), f"model and true paths differ"
+    assert np.isclose(obj, true_obj), "model and true objective values differ"
+    assert (sol == true_sol).all(), "model and true paths differ"
 
 
 def test_multigraph_ilp_sp(multigraph):
@@ -85,5 +85,5 @@ def test_multigraph_ilp_sp(multigraph):
     model.setObj(cost)
     sol, obj = model.solve()
 
-    assert np.isclose(obj, true_obj), f"model and true objective values differ"
-    assert (sol == true_sol).all(), f"model and true paths differ"
+    assert np.isclose(obj, true_obj), "model and true objective values differ"
+    assert (sol == true_sol).all(), "model and true paths differ"

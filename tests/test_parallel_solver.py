@@ -34,4 +34,4 @@ def test_parallel_solver(processes):
 
     for feats, costs, sols, objs in loader:
         sols_pred = parallel_solver(costs)
-        assert (sols_pred == sols).all()
+        assert (sols_pred == sols).all(), "solutions differ"

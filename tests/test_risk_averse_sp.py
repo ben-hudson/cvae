@@ -46,9 +46,9 @@ def test_VaR_shortestpath(random_graph: nx.DiGraph, risk_level: float):
     risk_neutral_VaR = get_VaR(risk_level, risk_neutral_obj_mean, risk_neutral_obj_std)
     risk_averse_VaR = get_VaR(risk_level, risk_averse_obj_mean, risk_averse_obj_std)
 
-    assert np.isclose(risk_neutral_obj_mean, risk_neutral_obj)
-    assert np.isclose(risk_averse_obj, risk_averse_VaR, rtol=0.001)
-    assert risk_neutral_VaR >= risk_averse_VaR
+    assert np.isclose(risk_neutral_obj_mean, risk_neutral_obj), "risk neutral objective values differ"
+    assert np.isclose(risk_averse_obj, risk_averse_VaR, rtol=0.001), "risk averse objective values differ"
+    assert risk_neutral_VaR >= risk_averse_VaR, "risk neutral VaR is less than risk averse VaR"
 
 
 def test_CVaR_shortestpath(random_graph: nx.DiGraph, risk_level: float):
@@ -76,6 +76,6 @@ def test_CVaR_shortestpath(random_graph: nx.DiGraph, risk_level: float):
     risk_neutral_CVaR = get_CVaR(risk_level, risk_neutral_obj_mean, risk_neutral_obj_std, tail="right")
     risk_averse_CVaR = get_CVaR(risk_level, risk_averse_obj_mean, risk_averse_obj_std, tail="right")
 
-    assert np.isclose(risk_neutral_obj_mean, risk_neutral_obj)
-    assert np.isclose(risk_averse_obj, risk_averse_CVaR)
-    assert risk_neutral_CVaR >= risk_averse_CVaR
+    assert np.isclose(risk_neutral_obj_mean, risk_neutral_obj), "risk neutral objective values differ"
+    assert np.isclose(risk_averse_obj, risk_averse_CVaR), "risk averse objective values differ"
+    assert risk_neutral_CVaR >= risk_averse_CVaR, "risk neutral CVaR is less than risk averse CVaR"

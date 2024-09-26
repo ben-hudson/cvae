@@ -1,4 +1,5 @@
 import torch
+import torch.distributions as D
 
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from os import devnull
@@ -14,17 +15,17 @@ def hush():
             yield (err, out)
 
 
-def norm(batch: torch.Tensor):
+def norm(batch: torch.Tensor) -> torch.Tensor:
     assert batch.dim() == 2, f"expected a 2D tensor (a batch of vectors), but got a {batch.dim()}D one"
     return batch / batch.norm(p=2, dim=-1).unsqueeze(-1)
 
 
-def norm_normal(batch: torch.distributions.Normal):
-    assert isinstance(batch, torch.distributions.Normal), f"expected a normal distribution but got {type(batch)}"
+def norm_normal(batch: D.Normal) -> D.Normal:
+    assert isinstance(batch, D.Normal), f"expected a normal distribution but got {type(batch)}"
     assert batch.loc.dim() == 2, f"expected a 2D tensor (a batch of vectors), but got {batch.loc.dim()}D one"
     norm = batch.loc.norm(dim=-1).unsqueeze(-1)
-    return torch.distributions.Normal(batch.loc / norm, batch.scale / norm)
+    return D.Normal(batch.loc / norm, batch.scale / norm)
 
 
-def is_integer(batch):
+def is_integer(batch) -> bool:
     return ((batch == 0) | (batch == 1)).all()
