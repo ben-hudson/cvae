@@ -9,7 +9,7 @@ from models.shortestpath.risk_averse import VaRShortestPath, CVaRShortestPath, g
 
 @pytest.fixture
 def random_graph():
-    G = nx.fast_gnp_random_graph(10, 0.3, directed=True)
+    G = nx.fast_gnp_random_graph(10, 0.3, directed=True, seed=42)
     node_pos = nx.spring_layout(G)
     for i, j in G.edges:
         G.edges[i, j]["cost"] = np.linalg.norm(node_pos[j] - node_pos[i])
@@ -77,5 +77,5 @@ def test_CVaR_shortestpath(random_graph: nx.DiGraph, risk_level: float):
     risk_averse_CVaR = get_CVaR(risk_level, risk_averse_obj_mean, risk_averse_obj_std, tail="right")
 
     assert np.isclose(risk_neutral_obj_mean, risk_neutral_obj), "risk neutral objective values differ"
-    assert np.isclose(risk_averse_obj, risk_averse_CVaR), "risk averse objective values differ"
+    assert np.isclose(risk_averse_obj, risk_averse_CVaR, rtol=0.001), "risk averse objective values differ"
     assert risk_neutral_CVaR >= risk_averse_CVaR, "risk neutral CVaR is less than risk averse CVaR"

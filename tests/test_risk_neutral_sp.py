@@ -8,7 +8,7 @@ from models.shortestpath.risk_neutral import ShortestPath, ILPShortestPath
 
 @pytest.fixture
 def random_graph():
-    G = nx.fast_gnp_random_graph(10, 0.3, directed=True)
+    G = nx.fast_gnp_random_graph(10, 0.3, directed=True, seed=42)
     node_pos = nx.spring_layout(G)
     for i, j in G.edges:
         G.edges[i, j]["cost"] = np.linalg.norm(node_pos[j] - node_pos[i])

@@ -19,4 +19,4 @@ class TwoPoint(D.TransformedDistribution):
 
     def _variance(self):
         # the variance a distribution is Var(X) = E[X^2] - E[X]^2
-        return self.highs**2 * self.probs + self.lows**2 * (1 - self.probs) - self.loc
+        return self.highs**2 * self.probs + self.lows**2 * (1 - self.probs) - self._expectation() ** 2
