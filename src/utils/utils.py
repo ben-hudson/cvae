@@ -22,9 +22,11 @@ def norm(batch: torch.Tensor) -> torch.Tensor:
 
 def norm_normal(batch: D.Normal) -> D.Normal:
     assert isinstance(batch, D.Normal), f"expected a normal distribution but got {type(batch)}"
-    assert batch.loc.dim() == 2, f"expected a 2D tensor (a batch of vectors), but got {batch.loc.dim()}D one"
-    norm = batch.loc.norm(dim=-1).unsqueeze(-1)
-    return D.Normal(batch.loc / norm, batch.scale / norm)
+    assert (
+        batch.loc.dim() == batch.scale.dim() == 2
+    ), f"expected a 2D tensor (a batch of vectors), but got {batch.loc.dim()}D one"
+    batch_norm = batch.loc.norm(dim=-1).unsqueeze(-1)
+    return D.Normal(batch.loc / batch_norm, batch.scale / batch_norm)
 
 
 def is_integer(batch) -> bool:

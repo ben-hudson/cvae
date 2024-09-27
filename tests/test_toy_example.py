@@ -20,7 +20,7 @@ def toy_data():
 
 
 def test_wait_and_see_policy(toy_graph, toy_data):
-    _, costs, _ = toy_data
+    _, costs, _, _ = toy_data
     solver = ParallelSolver(1, ILPShortestPath, toy_graph, 0, 1)
 
     sols = solver(costs)
@@ -34,7 +34,7 @@ def test_wait_and_see_policy(toy_graph, toy_data):
 
 
 def test_risk_neutral_policy(toy_graph, toy_data):
-    _, costs, cost_dist_params = toy_data
+    _, costs, _, cost_dist_params = toy_data
     solver = ParallelSolver(1, ILPShortestPath, toy_graph, 0, 1)
 
     cost_lows, cost_highs, cost_probs = cost_dist_params.chunk(3, dim=-1)
@@ -51,7 +51,7 @@ def test_risk_neutral_policy(toy_graph, toy_data):
 
 
 def test_risk_averse_policy(toy_graph, toy_data):
-    _, costs, cost_dist_params = toy_data
+    _, costs, _, cost_dist_params = toy_data
     solver = ParallelSolver(1, CVaRShortestPath, toy_graph, 0, 1, 0.9, tail="right")
 
     cost_lows, cost_highs, cost_probs = cost_dist_params.chunk(3, dim=-1)
