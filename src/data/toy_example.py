@@ -29,4 +29,4 @@ def gen_toy_data(n_samples):
     cost_dists = TwoPoint(cost_lows, cost_highs, cost_probs)
     cost_samples = cost_dists.sample()
 
-    return feats, cost_samples, "twopoint", cost_dist_params
+    return feats.unsqueeze(1), cost_samples, "twopoint", cost_dist_params

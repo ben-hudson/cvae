@@ -3,10 +3,10 @@ import torch
 
 from pyepo.data.dataset import optDataset
 from pyepo.model.opt import optModel
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.utils import compute_class_weight
 from distributions.twopoint import TwoPoint
-from utils.utils import is_integer, norm, norm_normal
+from utils.utils import is_integer, norm
 
 
 class CSLPDataset(optDataset):
@@ -28,43 +28,47 @@ class CSLPDataset(optDataset):
         self.is_integer = is_integer(self.sols)
         if self.is_integer:
             self.class_weights = compute_class_weight(
-                class_weight="balanced", classes=np.array([0, 1]), y=self.sols.flatten().numpy()
+                class_weight="balanced", classes=np.array([0, 1]), y=self.sols.flatten()
             )
 
-        self.feat_scaler = StandardScaler().fit(self.feats)
+        if is_integer(self.feats):
+            self.feat_scaler = MinMaxScaler()
+        else:
+            self.feat_scaler = StandardScaler()
+        self.feat_scaler.fit(self.feats)
+
+        # super converts sols and objs to numpy arrays, so covert them back
+        self.sols = torch.as_tensor(self.sols, dtype=torch.float)
+        self.objs = torch.as_tensor(self.objs, dtype=torch.float)
 
     def __getitem__(self, index):
         return self.feats[index], self.costs[index], self.sols[index], self.objs[index], self.cost_dist_params[index]
 
     def collate_batch(self, batch):
-        feats, costs, sols, objs, cost_dist_params = map(torch.cat, zip(*batch))
+        feats, costs, sols, objs, cost_dist_params = map(torch.stack, zip(*batch))
+
         if self.cost_dist == "twopoint":
             cost_dist_lows, cost_dist_highs, cost_dist_probs = torch.chunk(cost_dist_params, 3, dim=-1)
             cost_dists = TwoPoint(cost_dist_lows, cost_dist_highs, cost_dist_probs)
+
         elif self.cost_dist == "normal":
             cost_dist_mean, cost_dist_std = torch.chunk(cost_dist_params, 2, dim=-1)
             cost_dists = torch.distributions.Normal(cost_dist_mean, cost_dist_std)
+
         else:
             raise ValueError(f"unknown distribution {self.cost_dist}")
+
         return feats, costs, sols, objs, cost_dists
 
-    def norm_batch(self, batch):
-        feats, costs, sols, objs, cost_dist_params = batch
+    def norm(self, feats, costs, sols, objs):
+        feats_device = feats.device
+        feats_normed = torch.as_tensor(self.feat_scaler.transform(feats.cpu()), dtype=torch.float, device=feats_device)
 
-        feats_normed = torch.as_tensor(self.feat_scaler.transform(feats))
+        costs_normed, _ = norm(costs)
 
-        costs_normed = norm(costs)
-
-        assert self.is_integer, "not sure how to normalize non-integer solutions"
+        assert self.is_integer, "we only know how to norm integer solutions"
         sols_normed = sols
 
-        objs_normed = torch.bmm(costs_normed, sols)
+        objs_normed = torch.bmm(costs_normed.unsqueeze(1), sols_normed.unsqueeze(2)).squeeze(2)
 
-        if self.cost_dist == "normal":
-            cost_dist_mean, cost_dist_std = torch.chunk(cost_dist_params, 2)
-            cost_dist = torch.distributions.Normal(cost_dist_mean, cost_dist_std)
-            cost_dist_normed = norm_normal(cost_dist)
-        else:
-            raise ValueError(f"not sure how to normalize distribution {self.cost_dist}")
-
-        return feats_normed, costs_normed, sols_normed, objs_normed, cost_dist_normed
+        return feats_normed, costs_normed, sols_normed, objs_normed

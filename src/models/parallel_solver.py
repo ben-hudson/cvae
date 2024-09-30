@@ -1,5 +1,9 @@
 import torch
-import multiprocessing as mp
+import torch.multiprocessing as mp
+
+# got errors about ulimit when running as a slurm job
+# this was the recommended solution
+mp.set_sharing_strategy("file_system")
 
 
 class ParallelSolver(torch.nn.Module):

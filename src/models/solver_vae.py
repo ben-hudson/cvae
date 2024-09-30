@@ -7,7 +7,7 @@ from torch.distributions import kl_divergence, Normal
 from torchvision.ops import MLP
 from typing import Dict, Sequence, Tuple
 
-from utils.utils import norm, norm_normal
+from utils.utils import norm
 
 
 class SolverVAE(nn.Module):
@@ -62,7 +62,7 @@ class SolverVAE(nn.Module):
         prior = self._get_normal(prior_mean, prior_logvar)
         posterior = self._get_normal(posterior_mean, posterior_logvar)
 
-        return norm_normal(prior), norm_normal(posterior)
+        return prior, posterior
 
     def predict(
         self,
@@ -75,4 +75,4 @@ class SolverVAE(nn.Module):
             return norm(prior_mean)
         else:
             prior = self._get_normal(prior_mean, prior_logvar)
-            return norm_normal(prior)
+            return prior

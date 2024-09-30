@@ -6,7 +6,7 @@ def expectation(p: D.Distribution):
     if hasattr(p, "_expectation") and callable(p._expectation):
         return p._expectation()
     # otherwise, use implementation for some common distributions
-    elif isinstance(p, D.Normal) and not issubclass(p, D.Normal):
+    elif isinstance(p, D.Normal):
         return _expectation_normal(p)
     else:
         raise ValueError(f"not sure how to compute the expecation of {type(p)}")

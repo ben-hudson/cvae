@@ -17,16 +17,8 @@ def hush():
 
 def norm(batch: torch.Tensor) -> torch.Tensor:
     assert batch.dim() == 2, f"expected a 2D tensor (a batch of vectors), but got a {batch.dim()}D one"
-    return batch / batch.norm(p=2, dim=-1).unsqueeze(-1)
-
-
-def norm_normal(batch: D.Normal) -> D.Normal:
-    assert isinstance(batch, D.Normal), f"expected a normal distribution but got {type(batch)}"
-    assert (
-        batch.loc.dim() == batch.scale.dim() == 2
-    ), f"expected a 2D tensor (a batch of vectors), but got {batch.loc.dim()}D one"
-    batch_norm = batch.loc.norm(dim=-1).unsqueeze(-1)
-    return D.Normal(batch.loc / batch_norm, batch.scale / batch_norm)
+    batch_norm = batch.norm(p=2, dim=-1).unsqueeze(-1)
+    return batch / batch_norm, batch_norm
 
 
 def is_integer(batch) -> bool:

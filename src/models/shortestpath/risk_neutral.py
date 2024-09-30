@@ -39,15 +39,16 @@ class ShortestPath:
 
 # an ILP formulation of the SP problem
 # unfortunately, we have to stick to the PyEPO formula so it is compatible with other parts of the package
+# all __init__ args MUST BE CLASS MEMBERS WITH THE SAME NAME because of the stupid way the model is called in the loss functions
 class ILPShortestPath(optGrbModel):
     def __init__(self, graph: nx.DiGraph, source, sink) -> None:
-        self._graph = graph
-        self._source = source
-        self._sink = sink
+        self.graph = graph
+        self.source = source
+        self.sink = sink
 
-        assert self._graph.is_directed(), f"the graph should be directed"
-        assert self._source in self._graph.nodes, f"source node {self._source} does not exist in the graph"
-        assert self._sink in self._graph.nodes, f"sink node {self._sink} does not exist in the graph"
+        assert self.graph.is_directed(), f"the graph should be directed"
+        assert self.source in self.graph.nodes, f"source node {self.source} does not exist in the graph"
+        assert self.sink in self.graph.nodes, f"sink node {self.sink} does not exist in the graph"
 
         super().__init__()  # sets self._model and self.x via _getModel()
 
@@ -69,28 +70,28 @@ class ILPShortestPath(optGrbModel):
         model.ModelSense = GRB.MINIMIZE
 
         # returns a dict-like object where the edges are keys
-        x = model.addVars(self._graph.edges, name="x", vtype=GRB.BINARY)
+        x = model.addVars(self.graph.edges, name="x", vtype=GRB.BINARY)
 
         # flow conservation on each node
-        for n in self._graph.nodes:
+        for n in self.graph.nodes:
             expr = 0
 
             # annoying, but this is how networkx works
-            if self._graph.is_multigraph():
-                for e in self._graph.in_edges(n, keys=True):
+            if self.graph.is_multigraph():
+                for e in self.graph.in_edges(n, keys=True):
                     expr += x[e]
-                for e in self._graph.out_edges(n, keys=True):
+                for e in self.graph.out_edges(n, keys=True):
                     expr -= x[e]
 
             else:
-                for e in self._graph.in_edges(n):
+                for e in self.graph.in_edges(n):
                     expr += x[e]
-                for e in self._graph.out_edges(n):
+                for e in self.graph.out_edges(n):
                     expr -= x[e]
 
-            if n == self._source:
+            if n == self.source:
                 model.addConstr(expr == -1)
-            elif n == self._sink:
+            elif n == self.sink:
                 model.addConstr(expr == 1)
             else:
                 model.addConstr(expr == 0)

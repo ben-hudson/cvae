@@ -20,12 +20,13 @@ from models.risk_averse import CVaRShortestPath
 from models.shortestpath.risk_neutral import ILPShortestPath
 from models.solver_vae import SolverVAE
 from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from typing import Sequence
 from utils.accumulator import Accumulator
 from utils.eval import get_eval_metrics
 from utils.wandb import get_friendly_name, record_metrics, save_metrics
-from utils.utils import norm, norm_normal
+from utils.utils import norm
+from distributions import expectation, variance
 
 
 def get_argparser():
@@ -43,7 +44,6 @@ def get_argparser():
     model_args = parser.add_argument_group("model", description="Model arguments")
     model_args.add_argument("--mlp_hidden_dim", type=int, default=64, help="Dimension of hidden layers in MLPs")
     model_args.add_argument("--mlp_hidden_layers", type=int, default=2, help="Number of hidden layers in MLPs")
-    model_args.add_argument("--latent_dist", type=str, default="normal", choices=["normal"], help="Latent distribution")
     model_args.add_argument("--latent_dim", type=int, default=10, help="Latent dimension")
 
     train_args = parser.add_argument_group("training", description="Training arguments")
@@ -102,22 +102,29 @@ def get_train_metrics(
     return loss, metrics
 
 
-def train_step(model, solver, batch, device, train_set, kld_weight):
-    batch_normed = train_set.norm(batch)
-
-    feats, costs, sols, _, _ = batch_normed
+def train_step(
+    model: torch.nn.Module,
+    solver: pyepo.model.opt.optModel,
+    batch: tuple,
+    device: torch.device,
+    train_set: Dataset,
+    kld_weight: float,
+):
+    feats, costs, sols, objs, _ = batch
     feats = feats.to(device)
     costs = costs.to(device)
     sols = sols.to(device)
+    objs = objs.to(device)
+    feats_normed, _, sols_normed, _ = train_set.norm(feats, costs, sols, objs)
 
-    prior, posterior = model(feats, sols)
+    prior, posterior = model(feats_normed, sols_normed)
 
     # when we are training, we are imitating the wait-and-see decision-making process, which is risk agnostic
     # so we need to use the reparametrization trick
-    y_sample = posterior.rsample()
+    costs_sample = posterior.rsample()
     # norm the result to be consistent with other steps
-    y_sample_normed = norm(y_sample)
-    sols_pred = solver(y_sample_normed)
+    costs_sample_normed, _ = norm(costs_sample)
+    sols_pred = solver(costs_sample_normed)
 
     loss, train_metrics = get_train_metrics(prior, posterior, sols, sols_pred, train_set.class_weights, kld_weight)
 
@@ -125,34 +132,34 @@ def train_step(model, solver, batch, device, train_set, kld_weight):
 
 
 def eval_step(model, data_model, solver, batch, device, train_set, risk_level):
-    batch_normed = train_set.norm(batch)
+    feats, costs, sols, objs, cost_dists = batch
 
-    feats, costs, sols, objs, cost_dist = batch_normed
     feats = feats.to(device)
     costs = costs.to(device)
     sols = sols.to(device)
     objs = objs.to(device)
-    cost_dist_mean, cost_dist_std = cost_dist_params.to(device).chunk(2, dim=-1)
-    cost_dist = D.Normal(cost_dist_mean, cost_dist_std)
+    cost_dists = cost_dists.to(device)
+    feats_normed, _, _, _ = train_set.norm(feats, costs, sols, objs)
 
-    feats_normed, _, _, _, _ = train_set.norm(feats=feats)
+    cost_dists_pred = model.predict(feats_normed, point_prediction=False)
+    costs_pred = expectation(cost_dists_pred)
+    costs_pred_std = variance(cost_dists_pred).sqrt()
 
-    cost_dist_pred = model.predict(feats_normed, point_prediction=False)
-    costs_pred = cost_dist_pred.loc
+    costs_pred_normed, costs_pred_norm = norm(costs_pred)
+    costs_pred_std_normed = costs_pred_std / costs_pred_norm
 
     if risk_level is None:
-        sols_pred = solver(cost_dist_pred.loc)
+        sols_pred = solver(costs_pred_normed)
     else:
-        cost_dist_pred_params = torch.cat([cost_dist_pred.loc, cost_dist_pred.scale], dim=-1)
-        sols_pred = solver(cost_dist_pred_params)
+        sols_pred = solver(torch.cat([costs_pred_normed, costs_pred_std_normed], dim=-1))
 
     eval_metrics = get_eval_metrics(
         costs,
         sols,
-        cost_dist,
+        cost_dists,
         costs_pred,
         sols_pred,
-        cost_dist_pred,
+        cost_dists_pred,
         data_model.modelSense,
         train_set.class_weights,
     )
@@ -176,7 +183,9 @@ if __name__ == "__main__":
             tags=["experiment"] + args.wandb_tags,
         )
 
-    torch.manual_seed(args.seed)
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+
     device = "cuda:0" if torch.cuda.is_available() and not args.no_gpu else "cpu"
 
     if args.dataset == "toy":
@@ -196,18 +205,18 @@ if __name__ == "__main__":
     train_loader = DataLoader(
         train_set,
         batch_size=train_bs,
-        shuffle=True,
         num_workers=args.workers,
-        drop_last=True,
         collate_fn=train_set.collate_batch,
+        shuffle=True,
+        drop_last=True,
     )
     test_loader = DataLoader(
         test_set,
         batch_size=test_bs,
-        shuffle=False,
         num_workers=args.workers,
-        drop_last=True,
         collate_fn=test_set.collate_batch,
+        shuffle=False,
+        drop_last=True,
     )
 
     feats, costs, sols, objs, cost_dist_params = train_set[0]
@@ -218,7 +227,7 @@ if __name__ == "__main__":
 
     imle = pyepo.func.implicitMLE(
         data_model,
-        processes=args.workers,
+        processes=max(args.workers, 1),
         n_samples=args.solver_perturb_samples,
         sigma=args.solver_perturb_temp,
         two_sides=True,
@@ -242,9 +251,7 @@ if __name__ == "__main__":
             model.train()
             optimizer.zero_grad()
 
-            loss, train_metrics = train_step(
-                model, imle, batch, device, train_set, args.kld_weight, args.norm_latent_dists
-            )
+            loss, train_metrics = train_step(model, imle, batch, device, train_set, args.kld_weight)
 
             loss.backward()
             optimizer.step()
@@ -264,7 +271,6 @@ if __name__ == "__main__":
                         device,
                         train_set,
                         args.risk_level,
-                        args.norm_latent_dists,
                     )
 
                     for name, value in eval_metrics._asdict().items():
@@ -273,13 +279,13 @@ if __name__ == "__main__":
         if args.use_wandb:
             record_metrics(metrics, epoch)
 
-            if epoch % args.save_every == 0:
-                model_dir = os.environ.get("SLURM_TMPDIR", ".")
-                model_path = pathlib.Path(model_dir) / "model.pt"
-                name = run_name.replace(":", "_")
-                alias = run_name.replace(":", "=") + f"_epoch={epoch}"
-                torch.save(model.state_dict(), model_path)
-                wandb.log_model(name=name, path=model_path, aliases=[alias])
+            # if epoch % args.save_every == 0:
+            #     model_dir = os.environ.get("SLURM_TMPDIR", ".")
+            #     model_path = pathlib.Path(model_dir) / "model.pt"
+            #     name = run_name.replace(":", "_")
+            #     alias = run_name.replace(":", "=") + f"_epoch={epoch}"
+            #     torch.save(model.state_dict(), model_path)
+            #     wandb.log_model(name=name, path=model_path, aliases=[alias])
 
         for avg in metrics.values():
             avg.reset()

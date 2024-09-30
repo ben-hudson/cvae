@@ -6,7 +6,7 @@ def variance(p: D.Distribution):
     if hasattr(p, "_variance") and callable(p._variance):
         return p._variance()
     # otherwise, use implementation for some common distributions
-    elif isinstance(p, D.Normal) and not issubclass(p, D.Normal):
+    elif isinstance(p, D.Normal):
         return _variance_normal(p)
     else:
         raise ValueError(f"not sure how to compute the variance of {type(p)}")
