@@ -1,7 +1,7 @@
 import networkx as nx
 import torch
 
-from distributions.twopoint import TwoPoint
+from distributions import Normal, TwoPoint
 
 
 def get_toy_graph():
@@ -11,12 +11,21 @@ def get_toy_graph():
     return G
 
 
+def gen_toy_data(n_samples, dist="twopoint"):
+    if dist == "twopoint":
+        return _gen_twopoint_toy_data(n_samples)
+    elif dist == "normal":
+        return _gen_normal_toy_data(n_samples)
+    else:
+        raise ValueError(f"unknown dist {dist}")
+
+
 # the data-generating process is very simple
 # the graph has two edges
 # one edge cost can take a low value (5) with high probability (0.8) or a high value (20) with low probability (0.2)
 # the other edge cost takes an intermediate value (10) with probability 1.
 # these two costs switch depending on the binary input feature
-def gen_toy_data(n_samples):
+def _gen_twopoint_toy_data(n_samples):
     feats = torch.randint(0, 2, size=(n_samples,)).bool()
     cost_dist_params = torch.empty((n_samples, 3, 2))
 
@@ -24,9 +33,28 @@ def gen_toy_data(n_samples):
     cost_dist_params[rows, :, feats.int()] = torch.FloatTensor([5, 20, 0.2])
     cost_dist_params[rows, :, (~feats).int()] = torch.FloatTensor([0, 10, 1.0])
 
-    cost_dist_params = cost_dist_params.flatten(1)  # this is the form expected by
+    cost_dist_params = cost_dist_params.flatten(1)  # this is the form expected by CSLPDataset
     cost_lows, cost_highs, cost_probs = cost_dist_params.chunk(3, dim=-1)
     cost_dists = TwoPoint(cost_lows, cost_highs, cost_probs)
     cost_samples = cost_dists.sample()
 
     return feats.unsqueeze(1), cost_samples, "twopoint", cost_dist_params
+
+
+# the costs are normally distributed in this version
+# one edge has a low mean but a high variance, and the other has a high mean and low variance
+# these two switch depending on the binary input feature
+def _gen_normal_toy_data(n_samples):
+    feats = torch.randint(0, 2, size=(n_samples,)).bool()
+    cost_dist_params = torch.empty((n_samples, 2, 2))
+
+    rows = torch.arange(n_samples)
+    cost_dist_params[rows, :, feats.int()] = torch.FloatTensor([8, 6])
+    cost_dist_params[rows, :, (~feats).int()] = torch.FloatTensor([10, 1])
+
+    cost_dist_params = cost_dist_params.flatten(1)
+    cost_locs, cost_scales = cost_dist_params.chunk(2, dim=-1)
+    cost_dists = Normal(cost_locs, cost_scales)
+    cost_samples = cost_dists.sample()
+
+    return feats.unsqueeze(1), cost_samples, "normal", cost_dist_params

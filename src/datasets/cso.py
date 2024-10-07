@@ -5,7 +5,7 @@ from pyepo.data.dataset import optDataset
 from pyepo.model.opt import optModel
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.utils import compute_class_weight
-from distributions.twopoint import TwoPoint
+from distributions import Normal, TwoPoint
 from utils.utils import is_integer, norm
 
 
@@ -53,7 +53,7 @@ class CSLPDataset(optDataset):
 
         elif self.cost_dist == "normal":
             cost_dist_mean, cost_dist_std = torch.chunk(cost_dist_params, 2, dim=-1)
-            cost_dists = torch.distributions.Normal(cost_dist_mean, cost_dist_std)
+            cost_dists = Normal(cost_dist_mean, cost_dist_std)
 
         else:
             raise ValueError(f"unknown distribution {self.cost_dist}")

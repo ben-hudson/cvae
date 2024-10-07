@@ -1,8 +1,8 @@
 import argparse
+import json
 import os
 import pathlib
 import torch
-import uuid
 import wandb
 
 from ignite.exceptions import NotComputableError
@@ -31,6 +31,7 @@ def record_metrics(metrics: Dict[str, Metric], epoch: int):
             val = metric.compute()
             if isinstance(val, torch.Tensor) and val.dim() > 0:
                 wandb.log({name: wandb.Histogram(val)}, step=epoch)
+                wandb.log({name + "_mean": val.mean()}, step=epoch)
             else:
                 wandb.log({name: val}, step=epoch)
         except NotComputableError:
@@ -38,19 +39,35 @@ def record_metrics(metrics: Dict[str, Metric], epoch: int):
 
 
 def save_metrics(metrics: Dict[str, Metric], epoch: int):
-    artifact_name = f"{wandb.run.id}_epoch_{epoch}"
+    artifact_name = f"metrics_{wandb.run.id}"
     artifact = wandb.Artifact(artifact_name, "metrics")
+    # artifact.aliases.append(f"epoch={epoch}")
     tmp_dir = pathlib.Path(os.environ.get("SLURM_TMPDIR", "/tmp"))
 
     for name, metric in metrics.items():
-        assert os.path.sep not in name, f"{name} includes a path separator"
+        name = name.replace(os.path.sep, "_")
         val = metric.compute()
-        # lazy attempt to covert to a tensor
-        if not isinstance(val, torch.Tensor):
-            val = torch.Tensor(val)
         path = tmp_dir / f"{name}.pt"
-        torch.save(val, path)
+        torch.save(torch.as_tensor(val), path)
         artifact.add_file(path)
+
+    wandb.log_artifact(artifact)
+
+
+def save_model(model: torch.nn.Module, epoch: int):
+    artifact_name = f"model_{wandb.run.id}"
+    artifact = wandb.Artifact(artifact_name, "model")
+    # artifact.aliases.append(f"epoch={epoch}")
+    tmp_dir = pathlib.Path(os.environ.get("SLURM_TMPDIR", "/tmp"))
+
+    model_path = tmp_dir / "weights.pt"
+    torch.save(model.state_dict(), model_path)
+    artifact.add_file(model_path)
+
+    config_path = tmp_dir / "config.json"
+    json.dump(wandb.run.config.as_dict(), open(config_path, "w"))
+    artifact.add_file(config_path)
+
     wandb.log_artifact(artifact)
 
 

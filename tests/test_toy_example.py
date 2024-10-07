@@ -14,9 +14,9 @@ def toy_graph():
     return get_toy_graph()
 
 
-@pytest.fixture
-def toy_data():
-    return gen_toy_data(1000)
+@pytest.fixture(params=["twopoint"])
+def toy_data(request):
+    return gen_toy_data(1000, dist=request.param)
 
 
 def test_wait_and_see_policy(toy_graph, toy_data):
@@ -28,9 +28,9 @@ def test_wait_and_see_policy(toy_graph, toy_data):
 
     # the wait-and-see policy takes the random edge when it is short (80% of the time)
     # and it takes the deterministic edge when the random edge is long (20% of the time)
-    # therefore, the expected objective is 5*0.8 + 10*0.2 = 6
-    assert torch.isclose(objs.mean(), torch.tensor(6.0), rtol=0.1)
-    assert torch.isclose(objs.var(), torch.tensor(4.0), rtol=0.1)
+    obj_dist = TwoPoint(5, 10, 0.2)
+    assert torch.isclose(objs.mean(), expectation(obj_dist), rtol=0.1)
+    assert torch.isclose(objs.var(), variance(obj_dist), rtol=0.1)
 
 
 def test_risk_neutral_policy(toy_graph, toy_data):

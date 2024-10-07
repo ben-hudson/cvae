@@ -16,7 +16,7 @@ from ignite.metrics import Average
 from data.toy_example import gen_toy_data, get_toy_graph
 from datasets.cso import CSLPDataset
 from models.parallel_solver import ParallelSolver
-from models.risk_averse import CVaRShortestPath
+from models.shortestpath.risk_averse import CVaRShortestPath
 from models.shortestpath.risk_neutral import ILPShortestPath
 from models.solver_vae import SolverVAE
 from sklearn.model_selection import train_test_split
@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader, Dataset
 from typing import Sequence
 from utils.accumulator import Accumulator
 from utils.eval import get_eval_metrics
-from utils.wandb import get_friendly_name, record_metrics, save_metrics
+from utils.wandb import get_friendly_name, record_metrics, save_metrics, save_model
 from utils.utils import norm
 from distributions import expectation, variance
 
@@ -40,6 +40,9 @@ def get_argparser():
     dataset_args.add_argument("--n_features", type=int, default=5, help="Number of features")
     dataset_args.add_argument("--degree", type=int, default=1, help="Polynomial degree for encoding function")
     dataset_args.add_argument("--noise_width", type=float, default=0.5, help="Half-width of latent uniform noise")
+    dataset_args.add_argument(
+        "--dist", type=str, choices=["twopoint", "normal"], default="twopoint", help="Type of distribution"
+    )
 
     model_args = parser.add_argument_group("model", description="Model arguments")
     model_args.add_argument("--mlp_hidden_dim", type=int, default=64, help="Dimension of hidden layers in MLPs")
@@ -128,7 +131,7 @@ def train_step(
 
     loss, train_metrics = get_train_metrics(prior, posterior, sols, sols_pred, train_set.class_weights, kld_weight)
 
-    return loss, train_metrics
+    return prior, posterior, loss, train_metrics
 
 
 def eval_step(model, data_model, solver, batch, device, train_set, risk_level):
@@ -164,7 +167,7 @@ def eval_step(model, data_model, solver, batch, device, train_set, risk_level):
         train_set.class_weights,
     )
 
-    return eval_metrics
+    return cost_dists_pred, eval_metrics
 
 
 if __name__ == "__main__":
@@ -189,7 +192,7 @@ if __name__ == "__main__":
     device = "cuda:0" if torch.cuda.is_available() and not args.no_gpu else "cpu"
 
     if args.dataset == "toy":
-        feats, costs, cost_dist, cost_dist_params = gen_toy_data(args.n_samples)
+        feats, costs, cost_dist, cost_dist_params = gen_toy_data(args.n_samples, args.dist)
         graph = get_toy_graph()
         data_model = ILPShortestPath(graph, 0, 1)
 
@@ -251,7 +254,7 @@ if __name__ == "__main__":
             model.train()
             optimizer.zero_grad()
 
-            loss, train_metrics = train_step(model, imle, batch, device, train_set, args.kld_weight)
+            _, _, loss, train_metrics = train_step(model, imle, batch, device, train_set, args.kld_weight)
 
             loss.backward()
             optimizer.step()
@@ -263,7 +266,7 @@ if __name__ == "__main__":
             model.eval()
             with torch.no_grad():
                 for batch in test_loader:
-                    eval_metrics = eval_step(
+                    _, eval_metrics = eval_step(
                         model,
                         data_model,
                         parallel_solver,
@@ -279,13 +282,9 @@ if __name__ == "__main__":
         if args.use_wandb:
             record_metrics(metrics, epoch)
 
-            # if epoch % args.save_every == 0:
-            #     model_dir = os.environ.get("SLURM_TMPDIR", ".")
-            #     model_path = pathlib.Path(model_dir) / "model.pt"
-            #     name = run_name.replace(":", "_")
-            #     alias = run_name.replace(":", "=") + f"_epoch={epoch}"
-            #     torch.save(model.state_dict(), model_path)
-            #     wandb.log_model(name=name, path=model_path, aliases=[alias])
+            if epoch % args.save_every == 0:
+                save_metrics(metrics, epoch)
+                save_model(model, epoch)
 
         for avg in metrics.values():
             avg.reset()
