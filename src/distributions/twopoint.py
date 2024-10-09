@@ -3,10 +3,10 @@ import torch.distributions as D
 
 
 class TwoPoint(D.TransformedDistribution):
-    def __init__(self, lows, highs, probs):
-        self.lo = torch.as_tensor(lows)
-        self.hi = torch.as_tensor(highs)
-        self.prob = torch.as_tensor(probs)
+    def __init__(self, low, high, prob):
+        self.lo = torch.as_tensor(low)
+        self.hi = torch.as_tensor(high)
+        self.prob = torch.as_tensor(prob)
 
         # a two-point distribution is just a shifted and scaled bernoulli distribtion
         base_distribution = D.Bernoulli(self.prob)
