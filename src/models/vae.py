@@ -40,5 +40,5 @@ class VAE(nn.Module):
 
     def sample(self) -> torch.Tensor:
         latent_sample = self.prior.sample()
-        obs = self.generation_model(latent_sample)
-        return obs
+        obs_hat = self.generation_model(latent_sample)
+        return obs_hat
