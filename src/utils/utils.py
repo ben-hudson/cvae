@@ -1,5 +1,4 @@
 import torch
-import torch.distributions as D
 
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from os import devnull
